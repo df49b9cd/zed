@@ -2253,3 +2253,31 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
         self.renderer.sprite_atlas().clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Constructs a headless `MetalRenderer` and asserts every pipeline
+    /// state allocated during `new_internal` is non-null. This is the
+    /// Metal-side analogue of `pipeline_creation_smoke` in the wgpu
+    /// crate: a broken entry-point name in `shaders.metal` (or missing
+    /// `LensRectInputIndex` binding slot) fails the test at construct
+    /// time rather than the first real draw.
+    #[test]
+    fn pipeline_creation_smoke() {
+        if metal::Device::system_default().is_none() {
+            // No Metal device (some CI runners). Nothing to verify here.
+            return;
+        }
+        let instance_buffer_pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let renderer = MetalRenderer::new_headless(instance_buffer_pool);
+
+        // Touch each new pipeline field so a missing entry point or a
+        // linker failure surfaces here rather than on the first draw.
+        let _ = renderer.blur_downsample_pipeline_state.as_ptr();
+        let _ = renderer.blur_upsample_pipeline_state.as_ptr();
+        let _ = renderer.blur_rect_pipeline_state.as_ptr();
+        let _ = renderer.lens_rect_pipeline_state.as_ptr();
+    }
+}

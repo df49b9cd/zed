@@ -2650,14 +2650,24 @@ mod tests {
     async fn try_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
             .await
-            .ok()?;
+        {
+            Ok(a) => a,
+            Err(_) => instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::default(),
+                    compatible_surface: None,
+                    force_fallback_adapter: true,
+                })
+                .await
+                .ok()?,
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gpui_wgpu_pipeline_smoke"),
@@ -2672,12 +2682,41 @@ mod tests {
         Some((device, queue))
     }
 
+    /// Parse every WGSL source file used by the renderer via naga. Catches
+    /// syntax / type errors without needing a GPU, which is important
+    /// because `pipeline_creation_smoke` silently skips on adapter-less CI.
+    #[test]
+    fn wgsl_shaders_parse() {
+        let base = include_str!("shaders.wgsl");
+        let subpixel = include_str!("shaders_subpixel.wgsl");
+        let blur_io = include_str!("blur_io_shaders.wgsl");
+        let dual_source_bundle =
+            format!("enable dual_source_blending;\n{base}\n{subpixel}");
+        let sources = [
+            ("shaders.wgsl", base.to_string()),
+            ("blur_io_shaders.wgsl", blur_io.to_string()),
+            (
+                "shaders.wgsl + shaders_subpixel.wgsl (dual-source)",
+                dual_source_bundle,
+            ),
+        ];
+        for (name, source) in sources {
+            naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|err| panic!("{name}: WGSL parse error: {err}"));
+        }
+    }
+
     /// Compiles every render pipeline used by the renderer, including the
     /// new `blur_downsample` / `blur_upsample` / `blur_rect` / `lens_rect`
-    /// ones. Skipped when no wgpu adapter is available (CI without a GPU).
+    /// ones. Silently skipped locally when no adapter is available; panics
+    /// on CI (`CI` env var set) so a missing adapter is loud rather than
+    /// hidden in green build output.
     #[test]
     fn pipeline_creation_smoke() {
         let Some((device, _queue)) = pollster::block_on(try_headless_device()) else {
+            if std::env::var("CI").is_ok() {
+                panic!("pipeline_creation_smoke requires a wgpu adapter on CI");
+            }
             eprintln!("skipping pipeline_creation_smoke: no wgpu adapter available");
             return;
         };
