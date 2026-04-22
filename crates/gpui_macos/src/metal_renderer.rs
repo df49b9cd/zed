@@ -143,9 +143,18 @@ pub(crate) struct MetalRenderer {
     blur_rect_pipeline_state: metal::RenderPipelineState,
     lens_rect_pipeline_state: metal::RenderPipelineState,
     blur_sampler: metal::SamplerState,
-    blur_snapshot_texture: Option<metal::Texture>,
-    blur_half_texture: Option<metal::Texture>,
+    /// Dual-Kawase scratch chain. `blur_chain_textures[0]` is surface-sized
+    /// and receives the framebuffer snapshot; each subsequent level is
+    /// half-sized. `BlurEffect::kernel_levels` selects the depth used per
+    /// frame (1..=5).
+    blur_chain_textures: [Option<metal::Texture>; BLUR_CHAIN_LEVELS],
 }
+
+/// Maximum blur chain depth (`kernel_levels` is clamped to this).
+const BLUR_CHAIN_LEVELS: usize = 6;
+/// Reference blur radius. `BlurEffect::radius` scales the Kawase offset
+/// multiplier linearly relative to this.
+const BLUR_REFERENCE_RADIUS_PX: f32 = 20.0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -440,8 +449,7 @@ impl MetalRenderer {
             blur_rect_pipeline_state,
             lens_rect_pipeline_state,
             blur_sampler,
-            blur_snapshot_texture: None,
-            blur_half_texture: None,
+            blur_chain_textures: Default::default(),
         }
     }
 
@@ -490,8 +498,9 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
-            self.blur_snapshot_texture = None;
-            self.blur_half_texture = None;
+            for slot in &mut self.blur_chain_textures {
+                *slot = None;
+            }
             return;
         }
 
@@ -522,25 +531,28 @@ impl MetalRenderer {
             self.path_intermediate_msaa_texture = None;
         }
 
-        let full_descriptor = metal::TextureDescriptor::new();
-        full_descriptor.set_width(size.width.0 as u64);
-        full_descriptor.set_height(size.height.0 as u64);
-        full_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        full_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        full_descriptor.set_usage(
-            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-        );
-        self.blur_snapshot_texture = Some(self.device.new_texture(&full_descriptor));
+        if self.frame_sampling_enabled {
+            for level in 0..BLUR_CHAIN_LEVELS {
+                let width = (size.width.0 as u64).max(1) >> level;
+                let height = (size.height.0 as u64).max(1) >> level;
+                let width = width.max(1);
+                let height = height.max(1);
 
-        let half_descriptor = metal::TextureDescriptor::new();
-        half_descriptor.set_width((size.width.0 as u64).max(1) / 2);
-        half_descriptor.set_height((size.height.0 as u64).max(1) / 2);
-        half_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        half_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        half_descriptor.set_usage(
-            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-        );
-        self.blur_half_texture = Some(self.device.new_texture(&half_descriptor));
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(width);
+                descriptor.set_height(height);
+                descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                descriptor.set_usage(
+                    metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+                );
+                self.blur_chain_textures[level] = Some(self.device.new_texture(&descriptor));
+            }
+        } else {
+            for slot in &mut self.blur_chain_textures {
+                *slot = None;
+            }
+        }
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -868,6 +880,10 @@ impl MetalRenderer {
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
 
+        let blur_kernel_levels = scene.max_blur_kernel_levels();
+        let blur_offset_multiplier =
+            (scene.max_blur_radius().0 / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
+
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
@@ -966,8 +982,13 @@ impl MetalRenderer {
                         true
                     } else {
                         command_encoder.end_encoding();
-                        let did_snapshot = self
-                            .snapshot_and_blur_frame(texture, viewport_size, command_buffer);
+                        let did_snapshot = self.snapshot_and_blur_frame(
+                            texture,
+                            viewport_size,
+                            blur_kernel_levels,
+                            blur_offset_multiplier,
+                            command_buffer,
+                        );
                         command_encoder = new_command_encoder_for_texture(
                             command_buffer,
                             texture,
@@ -995,8 +1016,13 @@ impl MetalRenderer {
                         true
                     } else {
                         command_encoder.end_encoding();
-                        let did_snapshot = self
-                            .snapshot_and_blur_frame(texture, viewport_size, command_buffer);
+                        let did_snapshot = self.snapshot_and_blur_frame(
+                            texture,
+                            viewport_size,
+                            blur_kernel_levels,
+                            blur_offset_multiplier,
+                            command_buffer,
+                        );
                         command_encoder = new_command_encoder_for_texture(
                             command_buffer,
                             texture,
@@ -1351,17 +1377,26 @@ impl MetalRenderer {
         &self,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        kernel_levels: u32,
+        offset_multiplier: f32,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
-        let (Some(snapshot), Some(half)) = (
-            self.blur_snapshot_texture.as_ref(),
-            self.blur_half_texture.as_ref(),
-        ) else {
-            return false;
-        };
         if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
             return false;
         }
+        let kernel_levels = kernel_levels.clamp(1, (BLUR_CHAIN_LEVELS - 1) as u32) as usize;
+
+        // All chain levels we need must be populated. Any None means the
+        // renderer was initialized without `enable_frame_sampling`.
+        for level in 0..=kernel_levels {
+            if self.blur_chain_textures[level].is_none() {
+                return false;
+            }
+        }
+
+        let snapshot = self.blur_chain_textures[0]
+            .as_ref()
+            .expect("chain level 0 checked above");
 
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
@@ -1381,38 +1416,51 @@ impl MetalRenderer {
         );
         blit.end_encoding();
 
-        // Downsample snapshot (full) -> half.
-        let full_size = [
-            viewport_size.width.0 as f32,
-            viewport_size.height.0 as f32,
-        ];
-        let half_size = [
-            (viewport_size.width.0 as f32) * 0.5,
-            (viewport_size.height.0 as f32) * 0.5,
-        ];
+        for i in 0..kernel_levels {
+            let src = self.blur_chain_textures[i]
+                .as_ref()
+                .expect("chain level checked above");
+            let dst = self.blur_chain_textures[i + 1]
+                .as_ref()
+                .expect("chain level checked above");
+            let src_w = ((viewport_size.width.0 as f32) * 0.5f32.powi(i as i32)).max(1.0);
+            let src_h = ((viewport_size.height.0 as f32) * 0.5f32.powi(i as i32)).max(1.0);
+            self.run_blur_pass(
+                command_buffer,
+                src,
+                dst,
+                &self.blur_downsample_pipeline_state,
+                BlurParams {
+                    viewport_size: [src_w, src_h],
+                    offset_multiplier,
+                    pad: 0.0,
+                },
+            );
+        }
 
-        self.run_blur_pass(
-            command_buffer,
-            snapshot,
-            half,
-            &self.blur_downsample_pipeline_state,
-            BlurParams {
-                viewport_size: full_size,
-                offset_multiplier: 1.0,
-                pad: 0.0,
-            },
-        );
-        self.run_blur_pass(
-            command_buffer,
-            half,
-            snapshot,
-            &self.blur_upsample_pipeline_state,
-            BlurParams {
-                viewport_size: half_size,
-                offset_multiplier: 1.0,
-                pad: 0.0,
-            },
-        );
+        for step in 0..kernel_levels {
+            let src_level = kernel_levels - step;
+            let dst_level = src_level - 1;
+            let src = self.blur_chain_textures[src_level]
+                .as_ref()
+                .expect("chain level checked above");
+            let dst = self.blur_chain_textures[dst_level]
+                .as_ref()
+                .expect("chain level checked above");
+            let src_w = ((viewport_size.width.0 as f32) * 0.5f32.powi(src_level as i32)).max(1.0);
+            let src_h = ((viewport_size.height.0 as f32) * 0.5f32.powi(src_level as i32)).max(1.0);
+            self.run_blur_pass(
+                command_buffer,
+                src,
+                dst,
+                &self.blur_upsample_pipeline_state,
+                BlurParams {
+                    viewport_size: [src_w, src_h],
+                    offset_multiplier,
+                    pad: 0.0,
+                },
+            );
+        }
         true
     }
 
@@ -1457,7 +1505,7 @@ impl MetalRenderer {
         if rects.is_empty() {
             return true;
         }
-        let Some(ref snapshot) = self.blur_snapshot_texture else {
+        let Some(ref snapshot) = self.blur_chain_textures[0] else {
             return false;
         };
         align_offset(instance_offset);
@@ -1527,7 +1575,7 @@ impl MetalRenderer {
         if rects.is_empty() {
             return true;
         }
-        let Some(ref snapshot) = self.blur_snapshot_texture else {
+        let Some(ref snapshot) = self.blur_chain_textures[0] else {
             return false;
         };
         align_offset(instance_offset);
