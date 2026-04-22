@@ -1136,7 +1136,7 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.lens_rect,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            &[Some(color_target)],
             1,
             &shader_module,
         );
