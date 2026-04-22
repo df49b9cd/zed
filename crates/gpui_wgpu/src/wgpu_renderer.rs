@@ -1081,61 +1081,27 @@ impl WgpuRenderer {
         let blur_downsample = make_blur_io_pipeline("blur_downsample", "fs_blur_downsample");
         let blur_upsample = make_blur_io_pipeline("blur_upsample", "fs_blur_upsample");
 
-        let make_rect_pipeline = |name: &str,
-                                  vs_entry: &str,
-                                  fs_entry: &str,
-                                  data_layout: &wgpu::BindGroupLayout| {
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("{name}_pipeline_layout")),
-                bind_group_layouts: &[Some(&layouts.globals), Some(data_layout)],
-                immediate_size: 0,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader_module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader_module,
-                    entry_point: Some(fs_entry),
-                    targets: &[Some(color_target.clone())],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleStrip,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let blur_rect = make_rect_pipeline(
+        let blur_rect = create_pipeline(
             "blur_rect",
             "vs_blur_rect",
             "fs_blur_rect",
+            &layouts.globals,
             &layouts.blur_rect,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
         );
-        let lens_rect = make_rect_pipeline(
+        let lens_rect = create_pipeline(
             "lens_rect",
             "vs_lens_rect",
             "fs_lens_rect",
+            &layouts.globals,
             &layouts.lens_rect,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
         );
 
         WgpuPipelines {
