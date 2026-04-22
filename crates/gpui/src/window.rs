@@ -3448,9 +3448,9 @@ impl Window {
             content_mask: content_mask.scale(scale_factor),
             corner_radii: corner_radii.scale(scale_factor),
             blur_radius: effect.radius.scale(scale_factor),
-            refraction: effect.refraction,
-            depth: effect.depth,
-            dispersion: effect.dispersion,
+            refraction: effect.refraction * 100.0,
+            depth: effect.depth * 100.0,
+            dispersion: effect.dispersion * 100.0,
             splay: effect.splay.scale(scale_factor),
             light_angle_radians: effect.light_angle.0,
             pad_light: 0.0,
@@ -5979,6 +5979,11 @@ pub struct BlurEffect {
     pub radius: Pixels,
     /// Number of Kawase downsample/upsample passes. Higher = wider blur,
     /// lower = sharper. Clamped to 1..=5 by the renderer. Typical: 3.
+    ///
+    /// Independent of render-pass break cost: each primitive always forces
+    /// exactly one pass break regardless of `kernel_levels` — this only
+    /// controls post-process depth. See [`Window::paint_blur_rect`] for
+    /// the pass-break caveat.
     pub kernel_levels: u32,
     /// Colour layered on top of the blurred backdrop.
     pub tint: Hsla,
@@ -5994,24 +5999,43 @@ impl Default for BlurEffect {
     }
 }
 
+impl BlurEffect {
+    /// Construct a blur with HIG defaults (3 Kawase levels, no tint) at the
+    /// given radius.
+    pub fn new(radius: Pixels) -> Self {
+        Self {
+            radius,
+            ..Default::default()
+        }
+    }
+}
+
 /// A Liquid Glass composite (backdrop blur + refraction + chromatic
 /// aberration + Fresnel edge glow), applied to a rounded rectangle. Passed
 /// to [`Window::paint_lens_rect`].
 ///
-/// HIG defaults: refraction 100, depth 16, dispersion 0, splay 6 pt, light
-/// angle -45°, light intensity 67%.
+/// HIG defaults: refraction 1.0, depth 0.16, dispersion 0.0, splay 6 pt,
+/// light angle -45°, light intensity 0.67.
 #[derive(Clone, Copy, Debug)]
 pub struct LensEffect {
     /// Backdrop-blur radius, in window pixels.
     pub radius: Pixels,
-    /// Number of Kawase downsample/upsample passes.
+    /// Number of Kawase downsample/upsample passes. Higher = wider blur,
+    /// lower = sharper. Clamped to 1..=5 by the renderer. Typical: 3.
+    ///
+    /// Independent of render-pass break cost: each primitive always forces
+    /// exactly one pass break regardless of `kernel_levels` — this only
+    /// controls post-process depth. See [`Window::paint_lens_rect`] for
+    /// the pass-break caveat.
     pub kernel_levels: u32,
-    /// Parabolic refraction strength (Figma 0..100).
+    /// Parabolic refraction strength, normalized 0..1 (1.0 = HIG full
+    /// strength).
     pub refraction: f32,
-    /// Glass thickness (Figma 0..100). Modulates the refraction envelope —
-    /// thicker glass bends more.
+    /// Glass thickness, normalized 0..1. Modulates the refraction envelope
+    /// — thicker glass bends more.
     pub depth: f32,
-    /// Chromatic aberration amount. 0 = disabled.
+    /// Chromatic aberration amount, normalized 0..1 (1.0 ≈ max CA shift).
+    /// 0 = disabled.
     pub dispersion: f32,
     /// Fresnel edge-highlight band width, in window pixels.
     pub splay: Pixels,
@@ -6029,13 +6053,25 @@ impl Default for LensEffect {
         Self {
             radius: px(20.0),
             kernel_levels: 3,
-            refraction: 100.0,
-            depth: 16.0,
+            refraction: 1.0,
+            depth: 0.16,
             dispersion: 0.0,
             splay: px(6.0),
             light_angle: radians(-std::f32::consts::FRAC_PI_4),
             light_intensity: 0.67,
             tint: transparent_black(),
+        }
+    }
+}
+
+impl LensEffect {
+    /// Construct a lens with HIG defaults (3 Kawase levels, full refraction,
+    /// no dispersion, -45° light at 0.67 intensity, no tint) at the given
+    /// blur radius.
+    pub fn new(radius: Pixels) -> Self {
+        Self {
+            radius,
+            ..Default::default()
         }
     }
 }
