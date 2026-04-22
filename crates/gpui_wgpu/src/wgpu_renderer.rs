@@ -134,12 +134,27 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
-    blur_snapshot_texture: Option<wgpu::Texture>,
-    blur_snapshot_view: Option<wgpu::TextureView>,
-    blur_half_texture: Option<wgpu::Texture>,
-    blur_half_view: Option<wgpu::TextureView>,
+    /// Dual-Kawase scratch chain. `blur_chain_textures[0]` is surface-sized
+    /// and receives the framebuffer snapshot; each subsequent level is
+    /// half-sized. `BlurEffect::kernel_levels` selects the depth used per
+    /// frame (1..=5).
+    blur_chain_textures: [Option<wgpu::Texture>; BLUR_CHAIN_LEVELS],
+    blur_chain_views: [Option<wgpu::TextureView>; BLUR_CHAIN_LEVELS],
+    /// Bind groups pre-built for downsample/upsample passes. Downsample
+    /// pass `i` samples level `i` and writes level `i + 1`; upsample pass
+    /// `i` samples level `i + 1` and writes level `i`.
+    blur_down_bind_groups: [Option<wgpu::BindGroup>; BLUR_CHAIN_LEVELS - 1],
+    blur_up_bind_groups: [Option<wgpu::BindGroup>; BLUR_CHAIN_LEVELS - 1],
     blur_sampler: wgpu::Sampler,
+    /// Uniform buffer with per-pass `BlurParams` packed at
+    /// `min_uniform_buffer_offset_alignment`-sized strides. Bound with
+    /// dynamic offsets so each of the 2 × `BLUR_CHAIN_LEVELS - 1` passes
+    /// reads its own slot.
     blur_params_buffer: wgpu::Buffer,
+    /// Stride between adjacent `BlurParams` slots in `blur_params_buffer`,
+    /// equal to `size_of::<BlurParams>()` rounded up to
+    /// `min_uniform_buffer_offset_alignment`.
+    blur_params_slot_stride: u64,
 }
 
 impl WgpuResources {
@@ -148,12 +163,31 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
-        self.blur_snapshot_texture = None;
-        self.blur_snapshot_view = None;
-        self.blur_half_texture = None;
-        self.blur_half_view = None;
+        for slot in &mut self.blur_chain_textures {
+            *slot = None;
+        }
+        for slot in &mut self.blur_chain_views {
+            *slot = None;
+        }
+        for slot in &mut self.blur_down_bind_groups {
+            *slot = None;
+        }
+        for slot in &mut self.blur_up_bind_groups {
+            *slot = None;
+        }
     }
 }
+
+/// Maximum blur chain depth (`kernel_levels` is clamped to this). Each
+/// level is half the resolution of the previous; level 0 is the surface
+/// snapshot.
+const BLUR_CHAIN_LEVELS: usize = 6;
+/// One `BlurParams` slot per Kawase pass (down + up over the transitions
+/// between adjacent chain levels).
+const BLUR_PARAMS_SLOT_COUNT: usize = 2 * (BLUR_CHAIN_LEVELS - 1);
+/// Reference blur radius. `BlurEffect::radius` scales the Kawase offset
+/// multiplier linearly relative to this.
+const BLUR_REFERENCE_RADIUS_PX: f32 = 20.0;
 
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
@@ -418,18 +452,20 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
-        let blur_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blur_params_buffer"),
-            size: std::mem::size_of::<BlurParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
         let path_globals_offset = globals_size.next_multiple_of(uniform_alignment);
         let gamma_offset = (path_globals_offset + globals_size).next_multiple_of(uniform_alignment);
+
+        let blur_params_slot_stride = (std::mem::size_of::<BlurParams>() as u64)
+            .next_multiple_of(uniform_alignment);
+        let blur_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blur_params_buffer"),
+            size: blur_params_slot_stride * BLUR_PARAMS_SLOT_COUNT as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals_buffer"),
@@ -520,12 +556,13 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
-            blur_snapshot_texture: None,
-            blur_snapshot_view: None,
-            blur_half_texture: None,
-            blur_half_view: None,
+            blur_chain_textures: Default::default(),
+            blur_chain_views: Default::default(),
+            blur_down_bind_groups: Default::default(),
+            blur_up_bind_groups: Default::default(),
             blur_sampler,
             blur_params_buffer,
+            blur_params_slot_stride,
         };
 
         Ok(Self {
@@ -694,7 +731,7 @@ impl WgpuRenderer {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: true,
                         min_binding_size: NonZeroU64::new(
                             std::mem::size_of::<BlurParams>() as u64
                         ),
@@ -1210,11 +1247,10 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
-            if let Some(ref texture) = resources.blur_snapshot_texture {
-                texture.destroy();
-            }
-            if let Some(ref texture) = resources.blur_half_texture {
-                texture.destroy();
+            for slot in &resources.blur_chain_textures {
+                if let Some(texture) = slot.as_ref() {
+                    texture.destroy();
+                }
             }
 
             resources
@@ -1229,7 +1265,9 @@ impl WgpuRenderer {
     }
 
     fn ensure_intermediate_textures(&mut self) {
-        if self.resources().path_intermediate_texture.is_some() {
+        let needs_path = self.resources().path_intermediate_texture.is_none();
+        let needs_blur = self.resources().blur_chain_textures[0].is_none();
+        if !needs_path && !needs_blur {
             return;
         }
 
@@ -1239,72 +1277,119 @@ impl WgpuRenderer {
         let path_sample_count = self.rendering_params.path_sample_count;
         let resources = self.resources_mut();
 
-        let (t, v) = Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.path_intermediate_texture = Some(t);
-        resources.path_intermediate_view = Some(v);
+        if needs_path {
+            let (t, v) = Self::create_path_intermediate(&resources.device, format, width, height);
+            resources.path_intermediate_texture = Some(t);
+            resources.path_intermediate_view = Some(v);
 
-        let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
-            &resources.device,
-            format,
-            width,
-            height,
-            path_sample_count,
-        )
-        .map(|(t, v)| (Some(t), Some(v)))
-        .unwrap_or((None, None));
-        resources.path_msaa_texture = path_msaa_texture;
-        resources.path_msaa_view = path_msaa_view;
-    }
-
-    fn ensure_blur_textures(&mut self) {
-        if self.resources().blur_snapshot_texture.is_some() {
-            return;
-        }
-
-        let format = self.surface_config.format;
-        let width = self.surface_config.width.max(1);
-        let height = self.surface_config.height.max(1);
-        let half_width = (width / 2).max(1);
-        let half_height = (height / 2).max(1);
-        let resources = self.resources_mut();
-
-        let snapshot = resources.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("blur_snapshot"),
-            size: wgpu::Extent3d {
+            let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
+                &resources.device,
+                format,
                 width,
                 height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let snapshot_view = snapshot.create_view(&wgpu::TextureViewDescriptor::default());
-        resources.blur_snapshot_texture = Some(snapshot);
-        resources.blur_snapshot_view = Some(snapshot_view);
+                path_sample_count,
+            )
+            .map(|(t, v)| (Some(t), Some(v)))
+            .unwrap_or((None, None));
+            resources.path_msaa_texture = path_msaa_texture;
+            resources.path_msaa_view = path_msaa_view;
+        }
 
-        let half = resources.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("blur_half"),
-            size: wgpu::Extent3d {
-                width: half_width,
-                height: half_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let half_view = half.create_view(&wgpu::TextureViewDescriptor::default());
-        resources.blur_half_texture = Some(half);
-        resources.blur_half_view = Some(half_view);
+        if needs_blur {
+            Self::create_blur_chain(resources, format, width, height);
+        }
+    }
+
+    fn create_blur_chain(
+        resources: &mut WgpuResources,
+        surface_format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) {
+        // Use the non-sRGB variant of the surface format so the manual
+        // gamma chain in `blur_io_shaders.wgsl` is not double-applied when
+        // the surface itself is sRGB. When the surface is already
+        // non-sRGB this is a no-op.
+        let chain_format = surface_format.remove_srgb_suffix();
+
+        for level in 0..BLUR_CHAIN_LEVELS {
+            let level_width = (width >> level).max(1);
+            let level_height = (height >> level).max(1);
+            let usage = if level == 0 {
+                wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+            };
+            let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("blur_chain_{level}")),
+                size: wgpu::Extent3d {
+                    width: level_width,
+                    height: level_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: chain_format,
+                usage,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            resources.blur_chain_textures[level] = Some(texture);
+            resources.blur_chain_views[level] = Some(view);
+        }
+
+        // Pre-build every bind group for the passes the chain can host.
+        // Each pass reads one level and writes the adjacent level; the
+        // bind-group inputs (source view + sampler + params buffer) are
+        // stable for the lifetime of the chain.
+        for i in 0..BLUR_CHAIN_LEVELS - 1 {
+            let src_view = resources.blur_chain_views[i]
+                .as_ref()
+                .expect("chain view allocated above");
+            resources.blur_down_bind_groups[i] =
+                Some(Self::create_blur_io_bind_group(resources, src_view, "blur_down"));
+        }
+        for i in 0..BLUR_CHAIN_LEVELS - 1 {
+            let src_view = resources.blur_chain_views[i + 1]
+                .as_ref()
+                .expect("chain view allocated above");
+            resources.blur_up_bind_groups[i] =
+                Some(Self::create_blur_io_bind_group(resources, src_view, "blur_up"));
+        }
+    }
+
+    fn create_blur_io_bind_group(
+        resources: &WgpuResources,
+        source_view: &wgpu::TextureView,
+        label_prefix: &str,
+    ) -> wgpu::BindGroup {
+        resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("{label_prefix}_bind_group")),
+                layout: &resources.bind_group_layouts.blur_io,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(source_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &resources.blur_params_buffer,
+                            offset: 0,
+                            size: NonZeroU64::new(std::mem::size_of::<BlurParams>() as u64),
+                        }),
+                    },
+                ],
+            })
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1480,6 +1565,10 @@ impl WgpuRenderer {
             );
         }
 
+        let blur_kernel_levels = scene.max_blur_kernel_levels();
+        let blur_radius = scene.max_blur_radius().0;
+        let blur_offset_multiplier = (blur_radius / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
+
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
@@ -1595,8 +1684,12 @@ impl WgpuRenderer {
 
                             drop(pass);
 
-                            let did_snapshot =
-                                self.snapshot_and_blur_frame(&mut encoder, &frame.texture);
+                            let did_snapshot = self.snapshot_and_blur_frame(
+                                &mut encoder,
+                                &frame.texture,
+                                blur_kernel_levels,
+                                blur_offset_multiplier,
+                            );
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued_blur"),
@@ -1627,8 +1720,12 @@ impl WgpuRenderer {
 
                             drop(pass);
 
-                            let did_snapshot =
-                                self.snapshot_and_blur_frame(&mut encoder, &frame.texture);
+                            let did_snapshot = self.snapshot_and_blur_frame(
+                                &mut encoder,
+                                &frame.texture,
+                                blur_kernel_levels,
+                                blur_offset_multiplier,
+                            );
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued_lens"),
@@ -1876,50 +1973,80 @@ impl WgpuRenderer {
         }
     }
 
-    /// Copy the current swapchain contents into `blur_snapshot_texture` and
-    /// run a dual-Kawase down/up pass that leaves the blurred result back in
-    /// `blur_snapshot_texture`. Returns `false` if the platform cannot
-    /// snapshot the framebuffer (COPY_SRC missing) or if scratch textures
-    /// aren't allocated yet; callers should skip the blur/lens draw in that
-    /// case.
+    /// Copy the current swapchain contents into `blur_chain_textures[0]`
+    /// and run `kernel_levels` downsample + upsample passes (dual-Kawase).
+    /// The blurred result ends up back in `blur_chain_textures[0]`, which
+    /// `fs_blur_rect` / `fs_lens_rect` sample.
+    ///
+    /// `offset_multiplier` scales the Kawase tap offset; typically
+    /// `BlurEffect::radius / BLUR_REFERENCE_RADIUS_PX`.
+    ///
+    /// Returns `false` if the platform cannot snapshot the framebuffer
+    /// (COPY_SRC missing) or if scratch textures aren't allocated yet;
+    /// callers should skip the blur/lens draw in that case.
     fn snapshot_and_blur_frame(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         frame_texture: &wgpu::Texture,
+        kernel_levels: u32,
+        offset_multiplier: f32,
     ) -> bool {
         if !self.surface_supports_copy_src {
             return false;
         }
 
-        self.ensure_blur_textures();
+        let kernel_levels = kernel_levels.clamp(1, (BLUR_CHAIN_LEVELS - 1) as u32) as usize;
+        self.ensure_intermediate_textures();
 
         let width = self.surface_config.width.max(1);
         let height = self.surface_config.height.max(1);
-        let half_width = (width / 2).max(1);
-        let half_height = (height / 2).max(1);
-
-        let blur_params_full = BlurParams {
-            viewport_size: [width as f32, height as f32],
-            offset_multiplier: 1.0,
-            pad: 0.0,
-        };
-        let blur_params_half = BlurParams {
-            viewport_size: [half_width as f32, half_height as f32],
-            offset_multiplier: 1.0,
-            pad: 0.0,
-        };
-
         let resources = self.resources();
-        let (Some(snapshot_tex), Some(snapshot_view), Some(half_tex), Some(half_view)) = (
-            resources.blur_snapshot_texture.as_ref(),
-            resources.blur_snapshot_view.as_ref(),
-            resources.blur_half_texture.as_ref(),
-            resources.blur_half_view.as_ref(),
-        ) else {
-            return false;
-        };
 
-        let _ = half_tex;
+        if resources.blur_chain_textures[0].is_none() {
+            return false;
+        }
+
+        // Pack per-pass BlurParams. Slot layout:
+        //   0..kernel_levels              → downsample passes (i → i+1)
+        //   kernel_levels..2*kernel_levels → upsample passes  (i+1 → i),
+        //                                     iterated back down.
+        let slot_stride = resources.blur_params_slot_stride;
+        let mut slot_bytes = vec![0u8; (slot_stride as usize) * BLUR_PARAMS_SLOT_COUNT];
+        let write_slot = |slot_bytes: &mut [u8], slot: usize, params: BlurParams| {
+            let offset = slot * slot_stride as usize;
+            slot_bytes[offset..offset + std::mem::size_of::<BlurParams>()]
+                .copy_from_slice(bytemuck::bytes_of(&params));
+        };
+        for i in 0..kernel_levels {
+            let src_w = (width >> i).max(1);
+            let src_h = (height >> i).max(1);
+            write_slot(
+                &mut slot_bytes,
+                i,
+                BlurParams {
+                    viewport_size: [src_w as f32, src_h as f32],
+                    offset_multiplier,
+                    pad: 0.0,
+                },
+            );
+        }
+        for step in 0..kernel_levels {
+            let src_level = kernel_levels - step;
+            let src_w = (width >> src_level).max(1);
+            let src_h = (height >> src_level).max(1);
+            write_slot(
+                &mut slot_bytes,
+                kernel_levels + step,
+                BlurParams {
+                    viewport_size: [src_w as f32, src_h as f32],
+                    offset_multiplier,
+                    pad: 0.0,
+                },
+            );
+        }
+        resources
+            .queue
+            .write_buffer(&resources.blur_params_buffer, 0, &slot_bytes);
 
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
@@ -1929,7 +2056,9 @@ impl WgpuRenderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: snapshot_tex,
+                texture: resources.blur_chain_textures[0]
+                    .as_ref()
+                    .expect("chain level 0 checked above"),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1941,37 +2070,18 @@ impl WgpuRenderer {
             },
         );
 
-        // Downsample: snapshot (full) → half.
-        resources.queue.write_buffer(
-            &resources.blur_params_buffer,
-            0,
-            bytemuck::bytes_of(&blur_params_full),
-        );
-        let down_bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blur_downsample_bind_group"),
-                layout: &resources.bind_group_layouts.blur_io,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(snapshot_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: resources.blur_params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-        {
+        for i in 0..kernel_levels {
+            let dst_view = resources.blur_chain_views[i + 1]
+                .as_ref()
+                .expect("chain view allocated");
+            let bind_group = resources.blur_down_bind_groups[i]
+                .as_ref()
+                .expect("down bind group allocated");
+            let dynamic_offset = (i as u64 * slot_stride) as u32;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blur_downsample_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: half_view,
+                    view: dst_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1983,41 +2093,23 @@ impl WgpuRenderer {
                 ..Default::default()
             });
             pass.set_pipeline(&resources.pipelines.blur_downsample);
-            pass.set_bind_group(0, &down_bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[dynamic_offset]);
             pass.draw(0..3, 0..1);
         }
 
-        // Upsample: half → snapshot (overwrites snapshot with the blurred result).
-        resources.queue.write_buffer(
-            &resources.blur_params_buffer,
-            0,
-            bytemuck::bytes_of(&blur_params_half),
-        );
-        let up_bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blur_upsample_bind_group"),
-                layout: &resources.bind_group_layouts.blur_io,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(half_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: resources.blur_params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-        {
+        for step in 0..kernel_levels {
+            let dst_level = kernel_levels - step - 1;
+            let dst_view = resources.blur_chain_views[dst_level]
+                .as_ref()
+                .expect("chain view allocated");
+            let bind_group = resources.blur_up_bind_groups[dst_level]
+                .as_ref()
+                .expect("up bind group allocated");
+            let dynamic_offset = ((kernel_levels + step) as u64 * slot_stride) as u32;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blur_upsample_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: snapshot_view,
+                    view: dst_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -2029,7 +2121,7 @@ impl WgpuRenderer {
                 ..Default::default()
             });
             pass.set_pipeline(&resources.pipelines.blur_upsample);
-            pass.set_bind_group(0, &up_bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[dynamic_offset]);
             pass.draw(0..3, 0..1);
         }
 
@@ -2050,7 +2142,7 @@ impl WgpuRenderer {
             return false;
         };
         let resources = self.resources();
-        let Some(snapshot_view) = resources.blur_snapshot_view.as_ref() else {
+        let Some(snapshot_view) = resources.blur_chain_views[0].as_ref() else {
             return true;
         };
         let bind_group = resources
@@ -2094,7 +2186,7 @@ impl WgpuRenderer {
             return false;
         };
         let resources = self.resources();
-        let Some(snapshot_view) = resources.blur_snapshot_view.as_ref() else {
+        let Some(snapshot_view) = resources.blur_chain_views[0].as_ref() else {
             return true;
         };
         let bind_group = resources

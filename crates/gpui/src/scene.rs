@@ -162,6 +162,42 @@ impl Scene {
         self.lens_rects.sort_by_key(|lens| lens.order);
     }
 
+    /// Maximum `kernel_levels` requested by any `BlurRect` or `LensRect`
+    /// in the scene, clamped to `1..=5`. Used by renderers to size the
+    /// dual-Kawase snapshot chain for the frame. Returns 0 when neither
+    /// primitive kind is present.
+    pub fn max_blur_kernel_levels(&self) -> u32 {
+        let blur = self
+            .blur_rects
+            .iter()
+            .map(|b| b.kernel_levels)
+            .max()
+            .unwrap_or(0);
+        let lens = self
+            .lens_rects
+            .iter()
+            .map(|l| l.kernel_levels)
+            .max()
+            .unwrap_or(0);
+        blur.max(lens).min(5)
+    }
+
+    /// Maximum `blur_radius` requested by any `BlurRect` or `LensRect` in
+    /// the scene. Zero when neither primitive kind is present.
+    pub fn max_blur_radius(&self) -> ScaledPixels {
+        let blur = self
+            .blur_rects
+            .iter()
+            .map(|b| b.blur_radius.0)
+            .fold(0.0_f32, f32::max);
+        let lens = self
+            .lens_rects
+            .iter()
+            .map(|l| l.blur_radius.0)
+            .fold(0.0_f32, f32::max);
+        ScaledPixels(blur.max(lens))
+    }
+
     #[cfg_attr(
         all(
             any(target_os = "linux", target_os = "freebsd"),
