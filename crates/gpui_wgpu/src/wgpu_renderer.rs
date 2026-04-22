@@ -2363,6 +2363,28 @@ impl WgpuRenderer {
             self.surface_config.present_mode = mode;
         }
 
+        // The new surface's adapter may advertise different capabilities than
+        // the original. Re-query COPY_SRC so blur/lens draws don't panic in
+        // `surface.configure` (if the flag was previously true but the new
+        // adapter doesn't support it) or stay silently skipped forever (if
+        // the flag was previously false but the new adapter does support it).
+        let surface_supports_copy_src = self
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.borrow().as_ref().map(|wgpu_ctx| {
+                surface
+                    .get_capabilities(&wgpu_ctx.adapter)
+                    .usages
+                    .contains(wgpu::TextureUsages::COPY_SRC)
+            }))
+            .unwrap_or(false);
+        if surface_supports_copy_src {
+            self.surface_config.usage |= wgpu::TextureUsages::COPY_SRC;
+        } else {
+            self.surface_config.usage -= wgpu::TextureUsages::COPY_SRC;
+        }
+        self.surface_supports_copy_src = surface_supports_copy_src;
+
         {
             let res = self
                 .resources
