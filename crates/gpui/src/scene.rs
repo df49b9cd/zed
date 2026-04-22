@@ -1250,6 +1250,57 @@ mod tests {
     }
 
     #[test]
+    fn max_blur_kernel_levels_clamps_to_five() {
+        let mut scene = Scene::default();
+        let mut blur = make_blur_rect();
+        blur.kernel_levels = 10;
+        scene.insert_primitive(blur);
+        scene.finish();
+        assert_eq!(scene.max_blur_kernel_levels(), 5);
+    }
+
+    #[test]
+    fn max_blur_kernel_levels_empty_is_zero() {
+        let scene = Scene::default();
+        assert_eq!(scene.max_blur_kernel_levels(), 0);
+    }
+
+    #[test]
+    fn max_blur_radius_returns_max_of_blur_and_lens() {
+        let mut scene = Scene::default();
+        let mut blur = make_blur_rect();
+        blur.blur_radius = ScaledPixels(8.0);
+        scene.insert_primitive(blur);
+
+        scene.insert_primitive(LensRect {
+            order: 0,
+            kernel_levels: 3,
+            bounds: test_bounds(),
+            content_mask: test_content_mask(),
+            corner_radii: test_corners(),
+            blur_radius: ScaledPixels(24.0),
+            refraction: 12.0,
+            depth: 6.0,
+            dispersion: 0.0,
+            splay: ScaledPixels(1.5),
+            light_angle_radians: 0.0,
+            pad_light: 0.0,
+            light_intensity: 0.0,
+            pad: 0.0,
+            tint: Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.0,
+            },
+            pad2: 0.0,
+        });
+        scene.finish();
+
+        assert_eq!(scene.max_blur_radius(), ScaledPixels(24.0));
+    }
+
+    #[test]
     fn blur_rects_coalesce_when_adjacent() {
         let mut scene = Scene::default();
         scene.insert_primitive(BlurRect { ..make_blur_rect() });
