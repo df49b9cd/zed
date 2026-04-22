@@ -1399,6 +1399,7 @@ struct LensRectVarying {
   uint rect_id [[flat]];
   float4 position [[position]];
   float2 light_dir [[flat]];
+  float edge_band [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -1406,6 +1407,7 @@ struct LensRectFragmentInput {
   uint rect_id [[flat]];
   float4 position [[position]];
   float2 light_dir [[flat]];
+  float edge_band [[flat]];
 };
 
 vertex LensRectVarying lens_rect_vertex(
@@ -1421,6 +1423,14 @@ vertex LensRectVarying lens_rect_vertex(
   out.position = to_device_position(unit_vertex, rect.bounds, viewport_size);
   out.rect_id = rect_id;
   out.light_dir = float2(cos(rect.light_angle_radians), sin(rect.light_angle_radians));
+  float corner_avg = 0.25 * (
+    rect.corner_radii.top_left
+    + rect.corner_radii.top_right
+    + rect.corner_radii.bottom_right
+    + rect.corner_radii.bottom_left
+  );
+  float splay_px = max(rect.splay, 1.0);
+  out.edge_band = max(corner_avg * 0.5, splay_px);
   float4 clip = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask.bounds);
   out.clip_distance[0] = clip.x;
   out.clip_distance[1] = clip.y;
@@ -1439,6 +1449,13 @@ fragment float4 lens_rect_fragment(
   LensRect rect = rects[input.rect_id];
   float2 viewport_f = float2((float)viewport_size->width, (float)viewport_size->height);
 
+  float sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+  const float antialias_threshold = 0.5;
+  float aa = saturate(antialias_threshold - sdf);
+  if (aa <= 0.0) {
+    discard_fragment();
+  }
+
   float2 origin = float2(rect.bounds.origin.x, rect.bounds.origin.y);
   float2 size = float2(rect.bounds.size.width, rect.bounds.size.height);
   float2 center = origin + size * 0.5;
@@ -1455,34 +1472,28 @@ fragment float4 lens_rect_fragment(
   float2 base_uv = input.position.xy / viewport_f;
   float2 refracted_uv = base_uv - offset_px / viewport_f;
 
-  float ca_shift = normalized_dist * rect.dispersion;
-  float2 ca_dir = direction / viewport_f;
   float4 color;
-  color.r = blur_input.sample(blur_sampler, refracted_uv - ca_dir * ca_shift).r;
-  color.g = blur_input.sample(blur_sampler, refracted_uv).g;
-  color.b = blur_input.sample(blur_sampler, refracted_uv + ca_dir * ca_shift).b;
+  if (rect.dispersion > 0.0) {
+    float ca_shift = normalized_dist * rect.dispersion;
+    float2 ca_dir = direction / viewport_f;
+    color.r = blur_input.sample(blur_sampler, refracted_uv - ca_dir * ca_shift).r;
+    color.g = blur_input.sample(blur_sampler, refracted_uv).g;
+    color.b = blur_input.sample(blur_sampler, refracted_uv + ca_dir * ca_shift).b;
+  } else {
+    color = blur_input.sample(blur_sampler, refracted_uv);
+  }
   color.a = 1.0;
 
   float4 tint_rgba = hsla_to_rgba(rect.tint);
   color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
-  float2 light_dir = input.light_dir;
-  float sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
-  float edge_dist = fabs(sdf);
-  float splay_px = max(rect.splay, 1.0);
-  float corner_avg = 0.25 * (
-    rect.corner_radii.top_left
-    + rect.corner_radii.top_right
-    + rect.corner_radii.bottom_right
-    + rect.corner_radii.bottom_left
-  );
-  float edge_band = max(corner_avg * 0.5, splay_px);
-  float edge_falloff = smoothstep(edge_band, 0.0, edge_dist);
-  float facing = local_len > 0.001 ? clamp(dot(direction, light_dir), 0.0, 1.0) : 1.0;
-  float edge_glow = edge_falloff * facing * rect.light_intensity;
-  color = color + float4(edge_glow, edge_glow, edge_glow, 0.0);
+  if (rect.light_intensity > 0.0) {
+    float edge_dist = fabs(sdf);
+    float edge_falloff = smoothstep(input.edge_band, 0.0, edge_dist);
+    float facing = local_len > 0.001 ? clamp(dot(direction, input.light_dir), 0.0, 1.0) : 1.0;
+    float edge_glow = edge_falloff * facing * rect.light_intensity;
+    color = color + float4(edge_glow, edge_glow, edge_glow, 0.0);
+  }
 
-  const float antialias_threshold = 0.5;
-  float aa = saturate(antialias_threshold - sdf);
   return float4(color.rgb, color.a * aa);
 }

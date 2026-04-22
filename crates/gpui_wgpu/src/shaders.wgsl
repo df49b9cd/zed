@@ -1432,6 +1432,7 @@ struct LensRectVarying {
     @location(0) @interpolate(flat) rect_id: u32,
     @location(1) clip_distances: vec4<f32>,
     @location(2) @interpolate(flat) light_dir: vec2<f32>,
+    @location(3) @interpolate(flat) edge_band: f32,
 }
 
 @vertex
@@ -1449,6 +1450,14 @@ fn vs_lens_rect(
         cos(rect.light_angle_radians),
         sin(rect.light_angle_radians),
     );
+    let corner_avg = 0.25 * (
+        rect.corner_radii.top_left
+        + rect.corner_radii.top_right
+        + rect.corner_radii.bottom_right
+        + rect.corner_radii.bottom_left
+    );
+    let splay_px = max(rect.splay, 1.0);
+    out.edge_band = max(corner_avg * 0.5, splay_px);
     return out;
 }
 
@@ -1458,6 +1467,13 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
     let rect = b_lens_rects[input.rect_id];
+
+    let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+    let antialias_threshold = 0.5;
+    let aa = saturate(antialias_threshold - sdf);
+    if (aa <= 0.0) {
+        return vec4<f32>(0.0);
+    }
 
     let center = rect.bounds.origin + rect.bounds.size * 0.5;
     let half_size = rect.bounds.size * 0.5;
@@ -1477,38 +1493,32 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     let base_uv = input.position.xy / globals.viewport_size;
     let refracted_uv = base_uv - offset_px / globals.viewport_size;
 
-    let ca_shift = normalized_dist * rect.dispersion;
-    let ca_dir = direction / globals.viewport_size;
     var color: vec4<f32>;
-    color.r = textureSample(t_blur_input, s_blur_input, refracted_uv - ca_dir * ca_shift).r;
-    color.g = textureSample(t_blur_input, s_blur_input, refracted_uv).g;
-    color.b = textureSample(t_blur_input, s_blur_input, refracted_uv + ca_dir * ca_shift).b;
+    if (rect.dispersion > 0.0) {
+        let ca_shift = normalized_dist * rect.dispersion;
+        let ca_dir = direction / globals.viewport_size;
+        color.r = textureSample(t_blur_input, s_blur_input, refracted_uv - ca_dir * ca_shift).r;
+        color.g = textureSample(t_blur_input, s_blur_input, refracted_uv).g;
+        color.b = textureSample(t_blur_input, s_blur_input, refracted_uv + ca_dir * ca_shift).b;
+    } else {
+        color = textureSample(t_blur_input, s_blur_input, refracted_uv);
+    }
     color.a = 1.0;
 
     let tint_rgba = hsla_to_rgba(rect.tint);
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
-    let light_dir = input.light_dir;
-    let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
-    let edge_dist = abs(sdf);
-    let splay_px = max(rect.splay, 1.0);
-    let corner_avg = 0.25 * (
-        rect.corner_radii.top_left
-        + rect.corner_radii.top_right
-        + rect.corner_radii.bottom_right
-        + rect.corner_radii.bottom_left
-    );
-    let edge_band = max(corner_avg * 0.5, splay_px);
-    let edge_falloff = smoothstep(edge_band, 0.0, edge_dist);
-    let facing = select(
-        1.0,
-        clamp(dot(direction, light_dir), 0.0, 1.0),
-        local_len > 0.001,
-    );
-    let edge_glow = edge_falloff * facing * rect.light_intensity;
-    color = color + vec4<f32>(edge_glow, edge_glow, edge_glow, 0.0);
+    if (rect.light_intensity > 0.0) {
+        let edge_dist = abs(sdf);
+        let edge_falloff = smoothstep(input.edge_band, 0.0, edge_dist);
+        let facing = select(
+            1.0,
+            clamp(dot(direction, input.light_dir), 0.0, 1.0),
+            local_len > 0.001,
+        );
+        let edge_glow = edge_falloff * facing * rect.light_intensity;
+        color = color + vec4<f32>(edge_glow, edge_glow, edge_glow, 0.0);
+    }
 
-    let antialias_threshold = 0.5;
-    let aa = saturate(antialias_threshold - sdf);
     return blend_color(color, aa);
 }
