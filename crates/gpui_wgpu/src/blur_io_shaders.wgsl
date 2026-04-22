@@ -1,5 +1,4 @@
 // Dual-Kawase blur inner passes (Marius Bjorge, ARM, SIGGRAPH 2015).
-// Reference: crates/tahoe-gpui/src/foundations/shaders/dual_kawase.wgsl
 //
 // These fragment entry points run on fullscreen triangles against
 // progressively smaller scratch textures. The driving renderer is

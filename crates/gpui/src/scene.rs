@@ -675,8 +675,8 @@ impl From<BlurRect> for Primitive {
 
 /// A rounded rectangle with a full Liquid Glass composite: backdrop blur
 /// plus parabolic refraction, chromatic aberration, and a directional
-/// Fresnel edge highlight. Field layout mirrors the reference shader at
-/// `tahoe-gpui/crates/tahoe-gpui/src/foundations/shaders/glass_composite.wgsl`.
+/// Fresnel edge highlight. Field layout is kept in lockstep with the WGSL
+/// / MSL `LensRect` struct and padded to a 112-byte stride.
 ///
 /// Same caveat as `BlurRect`: each `LensRect` forces a render-pass break.
 #[derive(Debug, Clone, Copy)]
