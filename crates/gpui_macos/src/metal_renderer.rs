@@ -992,7 +992,7 @@ impl MetalRenderer {
             if !ok {
                 command_encoder.end_encoding();
                 anyhow::bail!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} blur rects, {} lens rects",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
@@ -1000,6 +1000,8 @@ impl MetalRenderer {
                     scene.monochrome_sprites.len(),
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),
+                    scene.blur_rects.len(),
+                    scene.lens_rects.len(),
                 );
             }
         }
