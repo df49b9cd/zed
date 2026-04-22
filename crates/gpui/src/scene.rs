@@ -1035,8 +1035,11 @@ impl PathVertex<Pixels> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlurRect, LensRect, PrimitiveBatch, Scene};
-    use crate::{Bounds, ContentMask, Corners, Hsla, Point, ScaledPixels, point, size};
+    use super::{BlurRect, LensRect, PrimitiveBatch, Quad, Scene};
+    use crate::{
+        Background, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, ScaledPixels, point,
+        size,
+    };
 
     fn test_bounds() -> Bounds<ScaledPixels> {
         Bounds {
@@ -1135,5 +1138,101 @@ mod tests {
             "expected a LensRects batch of size 1, got {:?}",
             batches
         );
+    }
+
+    fn make_blur_rect() -> BlurRect {
+        BlurRect {
+            order: 0,
+            kernel_levels: 3,
+            bounds: test_bounds(),
+            content_mask: test_content_mask(),
+            corner_radii: test_corners(),
+            blur_radius: ScaledPixels(12.0),
+            pad: 0.0,
+            tint: Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.3,
+            },
+        }
+    }
+
+    fn make_quad() -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::default(),
+            bounds: test_bounds(),
+            content_mask: test_content_mask(),
+            background: Background::from(Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 1.0,
+            }),
+            border_color: Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.0,
+            },
+            corner_radii: test_corners(),
+            border_widths: Edges {
+                top: ScaledPixels(0.0),
+                right: ScaledPixels(0.0),
+                bottom: ScaledPixels(0.0),
+                left: ScaledPixels(0.0),
+            },
+        }
+    }
+
+    #[test]
+    fn blur_rects_interleave_with_quads() {
+        let mut scene = Scene::default();
+        for order in 0..4 {
+            if order % 2 == 0 {
+                scene.insert_primitive(Quad { ..make_quad() });
+            } else {
+                scene.insert_primitive(BlurRect { ..make_blur_rect() });
+            }
+        }
+        scene.finish();
+
+        let batch_kinds: Vec<_> = scene
+            .batches()
+            .map(|b| match b {
+                PrimitiveBatch::Quads(_) => "Quads",
+                PrimitiveBatch::BlurRects(_) => "BlurRects",
+                other => panic!("unexpected batch kind: {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            batch_kinds,
+            vec!["Quads", "BlurRects", "Quads", "BlurRects"],
+            "expected alternating Quad/BlurRects batches"
+        );
+    }
+
+    #[test]
+    fn blur_rects_coalesce_when_adjacent() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(BlurRect { ..make_blur_rect() });
+        scene.insert_primitive(BlurRect { ..make_blur_rect() });
+        scene.finish();
+
+        let blur_batches: Vec<_> = scene
+            .batches()
+            .filter_map(|b| match b {
+                PrimitiveBatch::BlurRects(range) => Some(range),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            blur_batches.len(),
+            1,
+            "expected a single coalesced BlurRects batch, got {:?}",
+            blur_batches
+        );
+        assert_eq!(blur_batches[0].len(), 2);
     }
 }
