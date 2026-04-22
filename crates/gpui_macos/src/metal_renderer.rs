@@ -147,7 +147,7 @@ pub(crate) struct MetalRenderer {
 struct BlurParams {
     viewport_size: [f32; 2],
     offset_multiplier: f32,
-    _pad: f32,
+    pad: f32,
 }
 
 #[repr(C)]
@@ -1367,7 +1367,7 @@ impl MetalRenderer {
             BlurParams {
                 viewport_size: full_size,
                 offset_multiplier: 1.0,
-                _pad: 0.0,
+                pad: 0.0,
             },
         );
         self.run_blur_pass(
@@ -1378,7 +1378,7 @@ impl MetalRenderer {
             BlurParams {
                 viewport_size: half_size,
                 offset_multiplier: 1.0,
-                _pad: 0.0,
+                pad: 0.0,
             },
         );
         true

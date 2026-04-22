@@ -10,14 +10,15 @@ use crate::{
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    PromptLevel, Quad, Radians, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, radians, rems, size,
+    transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -3406,12 +3407,12 @@ impl Window {
         let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(BlurRect {
             order: 0,
-            kernel_levels: effect.kernel_levels,
+            kernel_levels: effect.kernel_levels.clamp(1, 5),
             bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             corner_radii: corner_radii.scale(scale_factor),
             blur_radius: effect.radius.scale(scale_factor),
-            _pad: 0.0,
+            pad: 0.0,
             tint: effect.tint.opacity(opacity),
         });
     }
@@ -3432,17 +3433,17 @@ impl Window {
         effect: LensEffect,
     ) {
         self.invalidator.debug_assert_paint();
+        debug_assert!(
+            effect.light_angle.0.is_finite(),
+            "LensEffect::light_angle must be finite"
+        );
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        let light_dir = Point {
-            x: effect.light_angle_radians.cos(),
-            y: effect.light_angle_radians.sin(),
-        };
         self.next_frame.scene.insert_primitive(LensRect {
             order: 0,
-            kernel_levels: effect.kernel_levels,
+            kernel_levels: effect.kernel_levels.clamp(1, 5),
             bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             corner_radii: corner_radii.scale(scale_factor),
@@ -3451,11 +3452,12 @@ impl Window {
             depth: effect.depth,
             dispersion: effect.dispersion,
             splay: effect.splay.scale(scale_factor),
-            light_dir,
+            light_angle_radians: effect.light_angle.0,
+            pad_light: 0.0,
             light_intensity: effect.light_intensity,
-            _pad: 0.0,
+            pad: 0.0,
             tint: effect.tint.opacity(opacity),
-            _pad2: 0.0,
+            pad2: 0.0,
         });
     }
 
@@ -6013,9 +6015,9 @@ pub struct LensEffect {
     pub dispersion: f32,
     /// Fresnel edge-highlight band width, in window pixels.
     pub splay: Pixels,
-    /// Light source direction, in radians. 0 = +x (right); rotates
-    /// counterclockwise. HIG default = -45° (upper-left quadrant).
-    pub light_angle_radians: f32,
+    /// Light source direction. 0 = +x (right); rotates counterclockwise.
+    /// HIG default = -45° (upper-left quadrant).
+    pub light_angle: Radians,
     /// Intensity of the Fresnel edge highlight, 0..1.
     pub light_intensity: f32,
     /// Colour overlay applied after refraction.
@@ -6031,7 +6033,7 @@ impl Default for LensEffect {
             depth: 16.0,
             dispersion: 0.0,
             splay: px(6.0),
-            light_angle_radians: -std::f32::consts::FRAC_PI_4,
+            light_angle: radians(-std::f32::consts::FRAC_PI_4),
             light_intensity: 0.67,
             tint: transparent_black(),
         }

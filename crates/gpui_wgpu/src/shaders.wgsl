@@ -1372,9 +1372,8 @@ struct LensRect {
     depth: f32,
     dispersion: f32,
     splay: f32,
-    // Stored as two scalars to match Rust's `Point<f32>` natural alignment.
-    light_dir_x: f32,
-    light_dir_y: f32,
+    light_angle_radians: f32,
+    pad_light: f32,
     light_intensity: f32,
     pad: f32,
     tint: Hsla,
@@ -1432,6 +1431,7 @@ struct LensRectVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) rect_id: u32,
     @location(1) clip_distances: vec4<f32>,
+    @location(2) @interpolate(flat) light_dir: vec2<f32>,
 }
 
 @vertex
@@ -1445,6 +1445,10 @@ fn vs_lens_rect(
     out.position = to_device_position(unit_vertex, rect.bounds);
     out.rect_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask);
+    out.light_dir = vec2<f32>(
+        cos(rect.light_angle_radians),
+        sin(rect.light_angle_radians),
+    );
     return out;
 }
 
@@ -1484,7 +1488,7 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     let tint_rgba = hsla_to_rgba(rect.tint);
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
-    let light_dir = vec2<f32>(rect.light_dir_x, rect.light_dir_y);
+    let light_dir = input.light_dir;
     let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
     let edge_dist = abs(sdf);
     let splay_px = max(rect.splay, 1.0);

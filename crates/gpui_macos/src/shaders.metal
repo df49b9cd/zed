@@ -1398,12 +1398,14 @@ fragment float4 blur_rect_fragment(
 struct LensRectVarying {
   uint rect_id [[flat]];
   float4 position [[position]];
+  float2 light_dir [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct LensRectFragmentInput {
   uint rect_id [[flat]];
   float4 position [[position]];
+  float2 light_dir [[flat]];
 };
 
 vertex LensRectVarying lens_rect_vertex(
@@ -1418,6 +1420,7 @@ vertex LensRectVarying lens_rect_vertex(
   LensRectVarying out;
   out.position = to_device_position(unit_vertex, rect.bounds, viewport_size);
   out.rect_id = rect_id;
+  out.light_dir = float2(cos(rect.light_angle_radians), sin(rect.light_angle_radians));
   float4 clip = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask.bounds);
   out.clip_distance[0] = clip.x;
   out.clip_distance[1] = clip.y;
@@ -1463,7 +1466,7 @@ fragment float4 lens_rect_fragment(
   float4 tint_rgba = hsla_to_rgba(rect.tint);
   color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
-  float2 light_dir = float2(rect.light_dir.x, rect.light_dir.y);
+  float2 light_dir = input.light_dir;
   float sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
   float edge_dist = fabs(sdf);
   float splay_px = max(rect.splay, 1.0);

@@ -125,11 +125,11 @@ impl Scene {
             }
             Primitive::BlurRect(blur) => {
                 blur.order = order;
-                self.blur_rects.push(blur.clone());
+                self.blur_rects.push(*blur);
             }
             Primitive::LensRect(lens) => {
                 lens.order = order;
-                self.lens_rects.push(lens.clone());
+                self.lens_rects.push(*lens);
             }
         }
         self.paint_operations
@@ -615,9 +615,9 @@ impl From<Shadow> for Primitive {
 /// framebuffer can be sampled, then runs its own post-process chain before
 /// the main pass resumes. Overuse is therefore expensive; prefer a handful
 /// per frame.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub struct BlurRect {
     pub order: DrawOrder,
     pub kernel_levels: u32,
@@ -625,9 +625,11 @@ pub struct BlurRect {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub blur_radius: ScaledPixels,
-    pub _pad: f32,
+    pub pad: f32,
     pub tint: Hsla,
 }
+
+const _: () = assert!(std::mem::size_of::<BlurRect>() == 80);
 
 impl From<BlurRect> for Primitive {
     fn from(blur: BlurRect) -> Self {
@@ -641,9 +643,9 @@ impl From<BlurRect> for Primitive {
 /// `tahoe-gpui/crates/tahoe-gpui/src/foundations/shaders/glass_composite.wgsl`.
 ///
 /// Same caveat as `BlurRect`: each `LensRect` forces a render-pass break.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub struct LensRect {
     pub order: DrawOrder,
     pub kernel_levels: u32,
@@ -655,15 +657,18 @@ pub struct LensRect {
     pub depth: f32,
     pub dispersion: f32,
     pub splay: ScaledPixels,
-    pub light_dir: Point<f32>,
+    pub light_angle_radians: f32,
+    pub pad_light: f32,
     pub light_intensity: f32,
-    pub _pad: f32,
+    pub pad: f32,
     pub tint: Hsla,
-    // Pad struct size to 112 bytes so that its WGSL `array<LensRect>` stride
-    // (rounded to the 8-byte alignment imposed by the nested `Bounds`' `vec2<f32>`)
+    // Pads the struct to 112 bytes so its WGSL `array<LensRect>` stride
+    // (rounded to 8-byte alignment for the nested `Bounds` `vec2<f32>`)
     // matches the Rust storage-buffer stride.
-    pub _pad2: f32,
+    pub pad2: f32,
 }
+
+const _: () = assert!(std::mem::size_of::<LensRect>() == 112);
 
 impl From<LensRect> for Primitive {
     fn from(lens: LensRect) -> Self {
@@ -1068,7 +1073,7 @@ mod tests {
             content_mask: test_content_mask(),
             corner_radii: test_corners(),
             blur_radius: ScaledPixels(12.0),
-            _pad: 0.0,
+            pad: 0.0,
             tint: Hsla {
                 h: 0.0,
                 s: 0.0,
@@ -1105,16 +1110,17 @@ mod tests {
             depth: 6.0,
             dispersion: 2.0,
             splay: ScaledPixels(1.5),
-            light_dir: Point { x: 0.5, y: 0.5 },
+            light_angle_radians: std::f32::consts::FRAC_PI_4,
+            pad_light: 0.0,
             light_intensity: 0.2,
-            _pad: 0.0,
+            pad: 0.0,
             tint: Hsla {
                 h: 0.6,
                 s: 0.2,
                 l: 0.8,
                 a: 0.1,
             },
-            _pad2: 0.0,
+            pad2: 0.0,
         });
         scene.finish();
 

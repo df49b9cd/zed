@@ -58,7 +58,7 @@ struct GammaParams {
 struct BlurParams {
     viewport_size: [f32; 2],
     offset_multiplier: f32,
-    _pad: f32,
+    pad: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -1935,12 +1935,12 @@ impl WgpuRenderer {
         let blur_params_full = BlurParams {
             viewport_size: [width as f32, height as f32],
             offset_multiplier: 1.0,
-            _pad: 0.0,
+            pad: 0.0,
         };
         let blur_params_half = BlurParams {
             viewport_size: [half_width as f32, half_height as f32],
             offset_multiplier: 1.0,
-            _pad: 0.0,
+            pad: 0.0,
         };
 
         let resources = self.resources();
