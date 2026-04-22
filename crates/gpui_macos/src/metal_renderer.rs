@@ -49,8 +49,9 @@ pub(crate) unsafe fn new_renderer(
     _native_view: *mut c_void,
     _bounds: gpui::Size<f32>,
     transparent: bool,
+    enable_frame_sampling: bool,
 ) -> Renderer {
-    MetalRenderer::new(context, transparent)
+    MetalRenderer::new(context, transparent, enable_frame_sampling)
 }
 
 pub(crate) struct InstanceBufferPool {
@@ -114,6 +115,10 @@ pub(crate) struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// True when the layer was configured with `framebuffer_only(false)`,
+    /// which is required to sample the framebuffer inside BlurRect /
+    /// LensRect draws. When false those primitives skip rendering.
+    frame_sampling_enabled: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -159,8 +164,21 @@ pub struct PathRasterizationVertex {
 }
 
 impl MetalRenderer {
-    /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
-    pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
+    /// Creates a new MetalRenderer with a CAMetalLayer for window-based
+    /// rendering.
+    ///
+    /// `enable_frame_sampling` controls whether the drawable is configured
+    /// so the blit encoder can sample it as the input of the BlurRect /
+    /// LensRect dual-Kawase snapshot. It forces `framebuffer_only(false)`
+    /// for the lifetime of the layer, which disables tile-memory
+    /// optimizations and regresses per-frame cost for windows that never
+    /// paint a blur/lens primitive. Enable it only for windows that
+    /// actually use those primitives.
+    pub fn new(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+        enable_frame_sampling: bool,
+    ) -> Self {
         let device = Self::create_device();
 
         let layer = metal::MetalLayer::new();
@@ -170,10 +188,14 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
-        // Disabled so the blit encoder can read the drawable as the input of
-        // the BlurRect/LensRect dual-Kawase snapshot (`snapshot_and_blur_frame`).
-        // Also enables visual tests to capture screenshots without ScreenCaptureKit.
-        layer.set_framebuffer_only(false);
+        let frame_sampling_enabled = enable_frame_sampling || cfg!(any(test, feature = "test-support"));
+        if frame_sampling_enabled {
+            // Required so `snapshot_and_blur_frame` can read the drawable
+            // (and so visual tests can capture screenshots without
+            // ScreenCaptureKit). Disables on-chip tile-memory
+            // optimizations for this layer.
+            layer.set_framebuffer_only(false);
+        }
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
@@ -184,7 +206,13 @@ impl MetalRenderer {
             ];
         }
 
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        Self::new_internal(
+            device,
+            Some(layer),
+            !transparent,
+            frame_sampling_enabled,
+            instance_buffer_pool,
+        )
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -194,7 +222,7 @@ impl MetalRenderer {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
         let device = Self::create_device();
-        Self::new_internal(device, None, true, instance_buffer_pool)
+        Self::new_internal(device, None, true, true, instance_buffer_pool)
     }
 
     fn create_device() -> metal::Device {
@@ -223,6 +251,7 @@ impl MetalRenderer {
         device: metal::Device,
         layer: Option<metal::MetalLayer>,
         opaque: bool,
+        frame_sampling_enabled: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     ) -> Self {
         #[cfg(feature = "runtime_shaders")]
@@ -386,6 +415,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            frame_sampling_enabled,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -932,7 +962,7 @@ impl MetalRenderer {
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
                 PrimitiveBatch::BlurRects(range) => {
                     let rects = &scene.blur_rects[range];
-                    if rects.is_empty() {
+                    if rects.is_empty() || !self.frame_sampling_enabled {
                         true
                     } else {
                         command_encoder.end_encoding();
@@ -961,7 +991,7 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::LensRects(range) => {
                     let rects = &scene.lens_rects[range];
-                    if rects.is_empty() {
+                    if rects.is_empty() || !self.frame_sampling_enabled {
                         true
                     } else {
                         command_encoder.end_encoding();
