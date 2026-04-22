@@ -883,6 +883,11 @@ impl MetalRenderer {
         let blur_kernel_levels = scene.max_blur_kernel_levels();
         let blur_offset_multiplier =
             (scene.max_blur_radius().0 / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
+        // Tracks whether the Kawase chain already reflects the drawable
+        // contents since the last non-blur batch. Reset to `false` at
+        // frame start and whenever any other primitive writes to the
+        // drawable.
+        let mut blur_snapshot_valid = false;
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -895,6 +900,10 @@ impl MetalRenderer {
         );
 
         for batch in scene.batches() {
+            let is_blur_batch = matches!(
+                batch,
+                PrimitiveBatch::BlurRects(_) | PrimitiveBatch::LensRects(_)
+            );
             let ok = match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
                     &scene.shadows[range],
@@ -982,13 +991,21 @@ impl MetalRenderer {
                         true
                     } else {
                         command_encoder.end_encoding();
-                        let did_snapshot = self.snapshot_and_blur_frame(
-                            texture,
-                            viewport_size,
-                            blur_kernel_levels,
-                            blur_offset_multiplier,
-                            command_buffer,
-                        );
+                        let did_snapshot = if blur_snapshot_valid {
+                            true
+                        } else {
+                            let ok = self.snapshot_and_blur_frame(
+                                texture,
+                                viewport_size,
+                                blur_kernel_levels,
+                                blur_offset_multiplier,
+                                command_buffer,
+                            );
+                            if ok {
+                                blur_snapshot_valid = true;
+                            }
+                            ok
+                        };
                         command_encoder = new_command_encoder_for_texture(
                             command_buffer,
                             texture,
@@ -1016,13 +1033,21 @@ impl MetalRenderer {
                         true
                     } else {
                         command_encoder.end_encoding();
-                        let did_snapshot = self.snapshot_and_blur_frame(
-                            texture,
-                            viewport_size,
-                            blur_kernel_levels,
-                            blur_offset_multiplier,
-                            command_buffer,
-                        );
+                        let did_snapshot = if blur_snapshot_valid {
+                            true
+                        } else {
+                            let ok = self.snapshot_and_blur_frame(
+                                texture,
+                                viewport_size,
+                                blur_kernel_levels,
+                                blur_offset_multiplier,
+                                command_buffer,
+                            );
+                            if ok {
+                                blur_snapshot_valid = true;
+                            }
+                            ok
+                        };
                         command_encoder = new_command_encoder_for_texture(
                             command_buffer,
                             texture,
@@ -1059,6 +1084,10 @@ impl MetalRenderer {
                     scene.blur_rects.len(),
                     scene.lens_rects.len(),
                 );
+            }
+            if !is_blur_batch {
+                // Drawing to the drawable invalidates the cached snapshot.
+                blur_snapshot_valid = false;
             }
         }
 

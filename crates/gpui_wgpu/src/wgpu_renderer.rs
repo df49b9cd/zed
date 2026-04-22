@@ -1572,6 +1572,11 @@ impl WgpuRenderer {
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
+            // Tracks whether the cached blur chain already reflects the
+            // contents of `frame.texture` as of the last non-blur batch.
+            // Reset to `false` at frame start and whenever a primitive
+            // batch draws to the main target.
+            let mut blur_snapshot_valid = false;
 
             let mut encoder =
                 self.resources()
@@ -1597,6 +1602,10 @@ impl WgpuRenderer {
                 });
 
                 for batch in scene.batches() {
+                    let is_blur_batch = matches!(
+                        batch,
+                        PrimitiveBatch::BlurRects(_) | PrimitiveBatch::LensRects(_)
+                    );
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
@@ -1684,12 +1693,20 @@ impl WgpuRenderer {
 
                             drop(pass);
 
-                            let did_snapshot = self.snapshot_and_blur_frame(
-                                &mut encoder,
-                                &frame.texture,
-                                blur_kernel_levels,
-                                blur_offset_multiplier,
-                            );
+                            let did_snapshot = if blur_snapshot_valid {
+                                true
+                            } else {
+                                let ok = self.snapshot_and_blur_frame(
+                                    &mut encoder,
+                                    &frame.texture,
+                                    blur_kernel_levels,
+                                    blur_offset_multiplier,
+                                );
+                                if ok {
+                                    blur_snapshot_valid = true;
+                                }
+                                ok
+                            };
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued_blur"),
@@ -1720,12 +1737,20 @@ impl WgpuRenderer {
 
                             drop(pass);
 
-                            let did_snapshot = self.snapshot_and_blur_frame(
-                                &mut encoder,
-                                &frame.texture,
-                                blur_kernel_levels,
-                                blur_offset_multiplier,
-                            );
+                            let did_snapshot = if blur_snapshot_valid {
+                                true
+                            } else {
+                                let ok = self.snapshot_and_blur_frame(
+                                    &mut encoder,
+                                    &frame.texture,
+                                    blur_kernel_levels,
+                                    blur_offset_multiplier,
+                                );
+                                if ok {
+                                    blur_snapshot_valid = true;
+                                }
+                                ok
+                            };
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued_lens"),
@@ -1752,6 +1777,11 @@ impl WgpuRenderer {
                     if !ok {
                         overflow = true;
                         break;
+                    }
+                    if !is_blur_batch {
+                        // Drawing to the main target invalidates the cached
+                        // blur snapshot.
+                        blur_snapshot_valid = false;
                     }
                 }
             }
