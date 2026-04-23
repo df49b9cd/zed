@@ -28,6 +28,27 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 
+// Track whether we've already logged the "not implemented on DirectX"
+// warning for each blur-adjacent primitive kind. The full port is tracked
+// separately; until then, we emit one warning per primitive kind per
+// process so the degradation is visible without spamming every frame.
+static BLUR_RECT_NOT_IMPLEMENTED_WARNED: OnceLock<()> = OnceLock::new();
+static LENS_RECT_NOT_IMPLEMENTED_WARNED: OnceLock<()> = OnceLock::new();
+static MIRROR_RECT_NOT_IMPLEMENTED_WARNED: OnceLock<()> = OnceLock::new();
+
+fn warn_once_primitive_unimplemented(
+    cell: &'static OnceLock<()>,
+    primitive: &'static str,
+) {
+    if cell.set(()).is_ok() {
+        log::warn!(
+            "{primitive} is not yet implemented on the DirectX backend; \
+             these primitives will render as transparent. Tracked as a \
+             follow-up to the blur-primitive PR."
+        );
+    }
+}
+
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
     pub grayscale_enhanced_contrast: f32,
@@ -336,15 +357,24 @@ impl DirectXRenderer {
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
                 PrimitiveBatch::BlurRects(_) => {
-                    // Not yet implemented on DirectX; tracked as a follow-up.
+                    warn_once_primitive_unimplemented(
+                        &BLUR_RECT_NOT_IMPLEMENTED_WARNED,
+                        "BlurRect",
+                    );
                     Ok(())
                 }
                 PrimitiveBatch::LensRects(_) => {
-                    // Not yet implemented on DirectX; tracked as a follow-up.
+                    warn_once_primitive_unimplemented(
+                        &LENS_RECT_NOT_IMPLEMENTED_WARNED,
+                        "LensRect",
+                    );
                     Ok(())
                 }
                 PrimitiveBatch::MirrorRects(_) => {
-                    // Not yet implemented on DirectX; tracked as a follow-up.
+                    warn_once_primitive_unimplemented(
+                        &MIRROR_RECT_NOT_IMPLEMENTED_WARNED,
+                        "MirrorRect",
+                    );
                     Ok(())
                 }
             }
