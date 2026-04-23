@@ -1357,8 +1357,11 @@ struct BlurRect {
     content_mask: Bounds,
     corner_radii: Corners,
     blur_radius: f32,
-    pad: f32,
+    blur_radius_end: f32,
+    gradient_direction: vec2<f32>,
     tint: Hsla,
+    // Aligns the struct stride to 96 bytes (matching the Rust side).
+    _pad_end: vec2<f32>,
 }
 
 struct LensRect {
@@ -1366,25 +1369,65 @@ struct LensRect {
     kernel_levels: u32,
     bounds: Bounds,
     content_mask: Bounds,
-    corner_radii: Corners,
+    shape_offset: u32,
+    shape_count: u32,
+    edge_blend_distance: f32,
     blur_radius: f32,
+    gradient_direction: vec2<f32>,
+    blur_radius_end: f32,
     refraction: f32,
     depth: f32,
     dispersion: f32,
     splay: f32,
     light_angle_radians: f32,
-    pad_light: f32,
     light_intensity: f32,
-    pad: f32,
     tint: Hsla,
     // Aligns the struct stride to 112 bytes (matching the Rust side).
     pad2: f32,
 }
 
+struct SceneBlurParams {
+    max_blur_radius: f32,
+    kernel_levels: f32,
+    _pad0: f32,
+    _pad1: f32,
+}
+
+struct LensShape {
+    bounds: Bounds,
+    corner_radii: Corners,
+    // Per-shape clip rectangle. Fragments outside this attenuate the
+    // shape's contribution to the SDF union instead of hard-clipping, so
+    // adjacent shapes in the same lens group don't develop a seam at the
+    // mask edge.
+    content_mask: Bounds,
+}
+
+struct MirrorRect {
+    order: u32,
+    kernel_levels: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    source_bounds: Bounds,
+    mirror_axis: u32,
+    clip_to_destination: u32,
+    blur_radius: f32,
+    blur_radius_end: f32,
+    gradient_direction: vec2<f32>,
+    tint: Hsla,
+}
+
 @group(1) @binding(0) var<storage, read> b_blur_rects: array<BlurRect>;
 @group(1) @binding(1) var<storage, read> b_lens_rects: array<LensRect>;
-@group(1) @binding(2) var t_blur_input: texture_2d<f32>;
+// Mipmapped pyramid: mip 0 = un-blurred framebuffer snapshot, each
+// subsequent mip = Kawase downsample result of the previous level.
+// Fragment shaders pick fractional LOD via `textureSampleLevel`.
+@group(1) @binding(2) var t_blur_pyramid: texture_2d<f32>;
 @group(1) @binding(3) var s_blur_input: sampler;
+@group(1) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
+@group(1) @binding(6) var<uniform> scene_blur: SceneBlurParams;
+@group(1) @binding(7) var<storage, read> b_mirror_rects: array<MirrorRect>;
 
 // --- BlurRect: rounded rect that samples the blurred framebuffer ---
 
@@ -1408,6 +1451,39 @@ fn vs_blur_rect(
     return out;
 }
 
+// Compute the per-pixel target blur radius for a linear-gradient blur.
+// Uniform-blur paths (gradient_direction == 0) return `radius_start`.
+fn gradient_target_radius(
+    frag_pos: vec2<f32>,
+    bounds: Bounds,
+    radius_start: f32,
+    radius_end: f32,
+    gradient_direction: vec2<f32>,
+) -> f32 {
+    let dir_len2 = dot(gradient_direction, gradient_direction);
+    if (dir_len2 < 1e-6) {
+        return radius_start;
+    }
+    let local = frag_pos - bounds.origin;
+    let extent = max(dot(bounds.size, gradient_direction), 1.0);
+    let t = clamp(dot(local, gradient_direction) / extent, 0.0, 1.0);
+    return mix(radius_start, radius_end, t);
+}
+
+// Sample the preserved Kawase downsample pyramid at a per-pixel blur
+// radius. Mip 0 is un-blurred; each subsequent mip doubles the effective
+// Gaussian sigma, so `level = kernel_levels + log2(strength)` with
+// trilinear filtering produces a smooth per-pixel variable-radius blur.
+fn sample_blur_pyramid(uv: vec2<f32>, target_radius: f32) -> vec4<f32> {
+    if (scene_blur.max_blur_radius <= 0.0) {
+        return textureSampleLevel(t_blur_pyramid, s_blur_input, uv, 0.0);
+    }
+    let strength = clamp(target_radius / scene_blur.max_blur_radius, 0.0, 1.0);
+    let raw_level = scene_blur.kernel_levels + log2(max(strength, 1e-6));
+    let level = clamp(raw_level, 0.0, scene_blur.kernel_levels);
+    return textureSampleLevel(t_blur_pyramid, s_blur_input, uv, level);
+}
+
 @fragment
 fn fs_blur_rect(input: BlurRectVarying) -> @location(0) vec4<f32> {
     if (any(input.clip_distances < vec4<f32>(0.0))) {
@@ -1415,7 +1491,14 @@ fn fs_blur_rect(input: BlurRectVarying) -> @location(0) vec4<f32> {
     }
     let rect = b_blur_rects[input.rect_id];
     let fb_uv = input.position.xy / globals.viewport_size;
-    var color = textureSample(t_blur_input, s_blur_input, fb_uv);
+    let target_radius = gradient_target_radius(
+        input.position.xy,
+        rect.bounds,
+        rect.blur_radius,
+        rect.blur_radius_end,
+        rect.gradient_direction,
+    );
+    var color = sample_blur_pyramid(fb_uv, target_radius);
     let tint_rgba = hsla_to_rgba(rect.tint);
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
@@ -1450,16 +1533,24 @@ fn vs_lens_rect(
         cos(rect.light_angle_radians),
         sin(rect.light_angle_radians),
     );
+    // Use the first shape's corner radii as the Fresnel edge-band reference;
+    // the difference when shapes differ is minor relative to the other
+    // shader outputs.
+    let shape0 = b_lens_shapes[rect.shape_offset];
     let corner_avg = 0.25 * (
-        rect.corner_radii.top_left
-        + rect.corner_radii.top_right
-        + rect.corner_radii.bottom_right
-        + rect.corner_radii.bottom_left
+        shape0.corner_radii.top_left
+        + shape0.corner_radii.top_right
+        + shape0.corner_radii.bottom_right
+        + shape0.corner_radii.bottom_left
     );
     let splay_px = max(rect.splay, 1.0);
     out.edge_band = max(corner_avg * 0.5, splay_px);
     return out;
 }
+
+// Max shapes per LensRect. Matches `MAX_LENS_SHAPES_PER_GROUP` in window.rs;
+// sized to keep the per-fragment loops cheap.
+const MAX_LENS_SHAPES: u32 = 8u;
 
 @fragment
 fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
@@ -1467,41 +1558,120 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
     let rect = b_lens_rects[input.rect_id];
+    let shape_count = min(rect.shape_count, MAX_LENS_SHAPES);
+    if (shape_count == 0u) {
+        return vec4<f32>(0.0);
+    }
+    let blend_k = max(rect.edge_blend_distance, 0.0);
+    let blend_shapes = blend_k > 0.0 && shape_count > 1u;
 
-    let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
     let antialias_threshold = 0.5;
-    let aa = saturate(antialias_threshold - sdf);
+    let zero_corners = Corners(0.0, 0.0, 0.0, 0.0);
+    var per_shape_sdf: array<f32, 8>;
+    var per_shape_mask_attn: array<f32, 8>;
+    var per_shape_dir: array<vec2<f32>, 8>;
+    var per_shape_norm_dist: array<f32, 8>;
+    var min_sdf: f32 = 1e20;
+    for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+        let s = b_lens_shapes[rect.shape_offset + i];
+        let d = quad_sdf(input.position.xy, s.bounds, s.corner_radii);
+        per_shape_sdf[i] = d;
+        min_sdf = min(min_sdf, d);
+
+        let mask_sdf = quad_sdf(input.position.xy, s.content_mask, zero_corners);
+        per_shape_mask_attn[i] = saturate(antialias_threshold - mask_sdf);
+
+        let center = s.bounds.origin + s.bounds.size * 0.5;
+        let half_size = s.bounds.size * 0.5;
+        let local_pos = input.position.xy - center;
+        let local_len = length(local_pos);
+        per_shape_dir[i] = select(
+            vec2<f32>(0.0, 0.0),
+            local_pos / max(local_len, 0.0001),
+            local_len > 0.001,
+        );
+        let safe_half = max(half_size, vec2<f32>(1.0, 1.0));
+        per_shape_norm_dist[i] = clamp(length(local_pos / safe_half), 0.0, 1.0);
+    }
+
+    var union_sdf: f32;
+    var weights: array<f32, 8>;
+    var coverage_factor: f32;
+    if (blend_shapes) {
+        var total_pre: f32 = 0.0;
+        var total_masked: f32 = 0.0;
+        for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+            let pre = exp(-(per_shape_sdf[i] - min_sdf) / blend_k);
+            let masked = per_shape_mask_attn[i] * pre;
+            weights[i] = masked;
+            total_pre = total_pre + pre;
+            total_masked = total_masked + masked;
+        }
+        if (total_masked < 1e-6) {
+            return vec4<f32>(0.0);
+        }
+        union_sdf = min_sdf - blend_k * log(max(total_pre, 1e-6));
+        let inv_masked = 1.0 / max(total_masked, 1e-6);
+        for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+            weights[i] = weights[i] * inv_masked;
+        }
+        coverage_factor = clamp(total_masked / max(total_pre, 1e-6), 0.0, 1.0);
+    } else {
+        var winner: u32 = 0u;
+        var min_d: f32 = per_shape_sdf[0];
+        for (var i: u32 = 1u; i < shape_count; i = i + 1u) {
+            if (per_shape_sdf[i] < min_d) {
+                min_d = per_shape_sdf[i];
+                winner = i;
+            }
+        }
+        union_sdf = min_d;
+        for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+            weights[i] = select(0.0, 1.0, i == winner);
+        }
+        coverage_factor = per_shape_mask_attn[winner];
+        if (coverage_factor < 1e-3) {
+            return vec4<f32>(0.0);
+        }
+    }
+
+    let aa = saturate(antialias_threshold - union_sdf) * coverage_factor;
     if (aa <= 0.0) {
         return vec4<f32>(0.0);
     }
 
-    let center = rect.bounds.origin + rect.bounds.size * 0.5;
-    let half_size = rect.bounds.size * 0.5;
-    let local_pos = input.position.xy - center;
-    let local_len = length(local_pos);
-    let direction = select(
-        vec2<f32>(0.0, 0.0),
-        local_pos / max(local_len, 0.0001),
-        local_len > 0.001,
-    );
-    let safe_half = max(half_size, vec2<f32>(1.0, 1.0));
-    let normalized_dist = clamp(length(local_pos / safe_half), 0.0, 1.0);
-
     let depth_scale = clamp(rect.depth * 0.01, 0.0, 1.0);
-    let distortion = (1.0 - normalized_dist * normalized_dist) * (1.0 + depth_scale);
-    let offset_px = distortion * direction * rect.refraction * 0.5;
+    var offset_px = vec2<f32>(0.0, 0.0);
+    var weighted_norm_dist: f32 = 0.0;
+    var weighted_dir = vec2<f32>(0.0, 0.0);
+    for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+        let nd = per_shape_norm_dist[i];
+        let distortion = (1.0 - nd * nd) * (1.0 + depth_scale);
+        offset_px = offset_px + weights[i] * (distortion * per_shape_dir[i] * rect.refraction * 0.5);
+        weighted_norm_dist = weighted_norm_dist + weights[i] * nd;
+        weighted_dir = weighted_dir + weights[i] * per_shape_dir[i];
+    }
     let base_uv = input.position.xy / globals.viewport_size;
     let refracted_uv = base_uv - offset_px / globals.viewport_size;
+    let target_radius = gradient_target_radius(
+        input.position.xy,
+        rect.bounds,
+        rect.blur_radius,
+        rect.blur_radius_end,
+        rect.gradient_direction,
+    );
 
     var color: vec4<f32>;
     if (rect.dispersion > 0.0) {
-        let ca_shift = normalized_dist * rect.dispersion;
-        let ca_dir = direction / globals.viewport_size;
-        color.r = textureSample(t_blur_input, s_blur_input, refracted_uv - ca_dir * ca_shift).r;
-        color.g = textureSample(t_blur_input, s_blur_input, refracted_uv).g;
-        color.b = textureSample(t_blur_input, s_blur_input, refracted_uv + ca_dir * ca_shift).b;
+        let ca_shift = weighted_norm_dist * rect.dispersion;
+        let ca_dir = weighted_dir / globals.viewport_size;
+        let uv_r = refracted_uv - ca_dir * ca_shift;
+        let uv_b = refracted_uv + ca_dir * ca_shift;
+        color.r = sample_blur_pyramid(uv_r, target_radius).r;
+        color.g = sample_blur_pyramid(refracted_uv, target_radius).g;
+        color.b = sample_blur_pyramid(uv_b, target_radius).b;
     } else {
-        color = textureSample(t_blur_input, s_blur_input, refracted_uv);
+        color = sample_blur_pyramid(refracted_uv, target_radius);
     }
     color.a = 1.0;
 
@@ -1509,16 +1679,85 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
     if (rect.light_intensity > 0.0) {
-        let edge_dist = abs(sdf);
+        let edge_dist = abs(union_sdf);
         let edge_falloff = smoothstep(input.edge_band, 0.0, edge_dist);
+        let weighted_len = length(weighted_dir);
         let facing = select(
             1.0,
-            clamp(dot(direction, input.light_dir), 0.0, 1.0),
-            local_len > 0.001,
+            clamp(dot(weighted_dir / weighted_len, input.light_dir), 0.0, 1.0),
+            weighted_len > 0.001,
         );
         let edge_glow = edge_falloff * facing * rect.light_intensity;
         color = color + vec4<f32>(edge_glow, edge_glow, edge_glow, 0.0);
     }
 
     return blend_color(color, aa);
+}
+
+// --- MirrorRect: sampled+flipped framebuffer region ---
+
+struct MirrorRectVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) rect_id: u32,
+    @location(1) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_mirror_rect(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32,
+) -> MirrorRectVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let rect = b_mirror_rects[instance_id];
+    var out = MirrorRectVarying();
+    out.position = to_device_position(unit_vertex, rect.bounds);
+    out.rect_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_mirror_rect(input: MirrorRectVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let rect = b_mirror_rects[input.rect_id];
+
+    let dest_origin = rect.bounds.origin;
+    let dest_size = max(rect.bounds.size, vec2<f32>(1.0));
+    var u = clamp((input.position.xy - dest_origin) / dest_size, vec2<f32>(0.0), vec2<f32>(1.0));
+
+    if ((rect.mirror_axis & 1u) != 0u) {
+        u.x = 1.0 - u.x;
+    }
+    if ((rect.mirror_axis & 2u) != 0u) {
+        u.y = 1.0 - u.y;
+    }
+
+    let src_pos = rect.source_bounds.origin + u * rect.source_bounds.size;
+    let src_uv = src_pos / globals.viewport_size;
+    if (src_uv.x < 0.0 || src_uv.x > 1.0 || src_uv.y < 0.0 || src_uv.y > 1.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let target_radius = gradient_target_radius(
+        input.position.xy,
+        rect.bounds,
+        rect.blur_radius,
+        rect.blur_radius_end,
+        rect.gradient_direction,
+    );
+    var color = sample_blur_pyramid(src_uv, target_radius);
+
+    let tint_rgba = hsla_to_rgba(rect.tint);
+    color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
+
+    var alpha = color.a;
+    if (rect.clip_to_destination != 0u) {
+        let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+        let antialias_threshold = 0.5;
+        let aa = saturate(antialias_threshold - sdf);
+        alpha = color.a * aa;
+    }
+    return vec4<f32>(color.rgb, alpha);
 }

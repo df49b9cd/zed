@@ -64,9 +64,13 @@ mod macos_build {
             "TransformationMatrix".into(),
             "BlurRect".into(),
             "LensRect".into(),
+            "LensShape".into(),
+            "MirrorRect".into(),
+            "SceneBlurParams".into(),
             "BlurIoInputIndex".into(),
             "BlurRectInputIndex".into(),
             "LensRectInputIndex".into(),
+            "MirrorRectInputIndex".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;
