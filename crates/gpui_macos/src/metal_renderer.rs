@@ -8,8 +8,8 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, BlurRect, Bounds, ContentMask, DevicePixels, LensRect, LensShape,
-    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
-    ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
+    MirrorRect, MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
+    Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -142,6 +142,7 @@ pub(crate) struct MetalRenderer {
     blur_upsample_pipeline_state: metal::RenderPipelineState,
     blur_rect_pipeline_state: metal::RenderPipelineState,
     lens_rect_pipeline_state: metal::RenderPipelineState,
+    mirror_rect_pipeline_state: metal::RenderPipelineState,
     blur_sampler: metal::SamplerState,
     /// Dual-Kawase scratch chain. `blur_chain_textures[0]` is surface-sized
     /// and receives the framebuffer snapshot; each subsequent level is
@@ -410,6 +411,14 @@ impl MetalRenderer {
             "lens_rect_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let mirror_rect_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "mirror_rect",
+            "mirror_rect_vertex",
+            "mirror_rect_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let blur_sampler = {
             let desc = metal::SamplerDescriptor::new();
@@ -453,6 +462,7 @@ impl MetalRenderer {
             blur_upsample_pipeline_state,
             blur_rect_pipeline_state,
             lens_rect_pipeline_state,
+            mirror_rect_pipeline_state,
             blur_sampler,
             blur_chain_textures: Default::default(),
             framebuffer_snapshot_texture: None,
@@ -926,7 +936,9 @@ impl MetalRenderer {
         for batch in scene.batches() {
             let is_blur_batch = matches!(
                 batch,
-                PrimitiveBatch::BlurRects(_) | PrimitiveBatch::LensRects(_)
+                PrimitiveBatch::BlurRects(_)
+                    | PrimitiveBatch::LensRects(_)
+                    | PrimitiveBatch::MirrorRects(_)
             );
             let ok = match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
@@ -1096,11 +1108,58 @@ impl MetalRenderer {
                         }
                     }
                 }
+                PrimitiveBatch::MirrorRects(range) => {
+                    let rects = &scene.mirror_rects[range];
+                    if rects.is_empty() || !self.frame_sampling_enabled {
+                        true
+                    } else {
+                        command_encoder.end_encoding();
+                        // Mirror always needs the un-blurred snapshot;
+                        // also run the Kawase chain so blur-enabled mirror
+                        // rects have a source to mix against.
+                        let did_snapshot = if blur_snapshot_valid {
+                            true
+                        } else {
+                            let levels = blur_kernel_levels.max(1);
+                            let ok = self.snapshot_and_blur_frame(
+                                texture,
+                                viewport_size,
+                                levels,
+                                blur_offset_multiplier,
+                                command_buffer,
+                            );
+                            if ok {
+                                blur_snapshot_valid = true;
+                            }
+                            ok
+                        };
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                        if did_snapshot {
+                            self.draw_mirror_rects(
+                                rects,
+                                scene_blur_params,
+                                instance_buffer,
+                                &mut instance_offset,
+                                viewport_size,
+                                command_encoder,
+                            )
+                        } else {
+                            true
+                        }
+                    }
+                }
             };
             if !ok {
                 command_encoder.end_encoding();
                 anyhow::bail!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} blur rects, {} lens rects",
+                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} blur rects, {} lens rects, {} mirror rects",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
@@ -1110,6 +1169,7 @@ impl MetalRenderer {
                     scene.surfaces.len(),
                     scene.blur_rects.len(),
                     scene.lens_rects.len(),
+                    scene.mirror_rects.len(),
                 );
             }
             if !is_blur_batch {
@@ -1758,6 +1818,88 @@ impl MetalRenderer {
         true
     }
 
+    fn draw_mirror_rects(
+        &self,
+        rects: &[MirrorRect],
+        scene_blur_params: SceneBlurParams,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+        let Some(ref snapshot) = self.blur_chain_textures[0] else {
+            return false;
+        };
+        let Some(ref unblurred) = self.framebuffer_snapshot_texture else {
+            return false;
+        };
+        align_offset(instance_offset);
+
+        command_encoder.set_render_pipeline_state(&self.mirror_rect_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            MirrorRectInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            MirrorRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            MirrorRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            MirrorRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            MirrorRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            MirrorRectInputIndex::SceneBlurParams as u64,
+            mem::size_of::<SceneBlurParams>() as u64,
+            &scene_blur_params as *const SceneBlurParams as *const _,
+        );
+        command_encoder
+            .set_fragment_texture(MirrorRectInputIndex::BlurTexture as u64, Some(snapshot));
+        command_encoder.set_fragment_texture(
+            MirrorRectInputIndex::UnblurredTexture as u64,
+            Some(unblurred),
+        );
+        command_encoder.set_fragment_sampler_state(
+            MirrorRectInputIndex::BlurSampler as u64,
+            Some(&self.blur_sampler),
+        );
+
+        let bytes_len = mem::size_of_val(rects);
+        let next_offset = *instance_offset + bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        unsafe {
+            let dst = (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset);
+            ptr::copy_nonoverlapping(rects.as_ptr() as *const u8, dst, bytes_len);
+        }
+
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            rects.len() as u64,
+        );
+        *instance_offset = next_offset;
+        true
+    }
+
     fn draw_underlines(
         &self,
         underlines: &[Underline],
@@ -2312,6 +2454,17 @@ enum LensRectInputIndex {
     SceneBlurParams = 7,
 }
 
+#[repr(C)]
+enum MirrorRectInputIndex {
+    Vertices = 0,
+    Rects = 1,
+    ViewportSize = 2,
+    BlurTexture = 3,
+    BlurSampler = 4,
+    UnblurredTexture = 5,
+    SceneBlurParams = 6,
+}
+
 /// Scene-wide blur parameters that the gradient-blur shaders use to
 /// normalize per-pixel strength. Written once per frame and bound to both
 /// `blur_rect` and `lens_rect` pipelines.
@@ -2392,5 +2545,6 @@ mod tests {
         let _ = renderer.blur_upsample_pipeline_state.as_ptr();
         let _ = renderer.blur_rect_pipeline_state.as_ptr();
         let _ = renderer.lens_rect_pipeline_state.as_ptr();
+        let _ = renderer.mirror_rect_pipeline_state.as_ptr();
     }
 }

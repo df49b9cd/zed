@@ -1651,3 +1651,101 @@ fragment float4 lens_rect_fragment(
 
   return float4(color.rgb, color.a * aa);
 }
+
+// --- MirrorRect: sampled+flipped framebuffer region ---
+//
+// Samples `source_bounds` from either the un-blurred or Kawase-blurred
+// snapshot (gradient blur supported the same way `BlurRect` / `LensRect`
+// do), applies the horizontal/vertical flips encoded in `mirror_axis`,
+// composites into `bounds` with a rounded-rect SDF clip and tint.
+
+struct MirrorRectVarying {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct MirrorRectFragmentInput {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex MirrorRectVarying mirror_rect_vertex(
+  uint unit_vertex_id [[vertex_id]],
+  uint rect_id [[instance_id]],
+  constant float2 *unit_vertices [[buffer(MirrorRectInputIndex_Vertices)]],
+  constant MirrorRect *rects [[buffer(MirrorRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(MirrorRectInputIndex_ViewportSize)]]
+) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  MirrorRect rect = rects[rect_id];
+  MirrorRectVarying out;
+  out.position = to_device_position(unit_vertex, rect.bounds, viewport_size);
+  out.rect_id = rect_id;
+  float4 clip = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask.bounds);
+  out.clip_distance[0] = clip.x;
+  out.clip_distance[1] = clip.y;
+  out.clip_distance[2] = clip.z;
+  out.clip_distance[3] = clip.w;
+  return out;
+}
+
+fragment float4 mirror_rect_fragment(
+  MirrorRectFragmentInput input [[stage_in]],
+  constant MirrorRect *rects [[buffer(MirrorRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(MirrorRectInputIndex_ViewportSize)]],
+  texture2d<float> blur_input [[texture(MirrorRectInputIndex_BlurTexture)]],
+  sampler blur_sampler [[sampler(MirrorRectInputIndex_BlurSampler)]],
+  texture2d<float> unblurred_input [[texture(MirrorRectInputIndex_UnblurredTexture)]],
+  constant SceneBlurParams *scene_blur [[buffer(MirrorRectInputIndex_SceneBlurParams)]]
+) {
+  MirrorRect rect = rects[input.rect_id];
+  float2 viewport_f = float2((float)viewport_size->width, (float)viewport_size->height);
+
+  // Normalized position within the destination rect.
+  float2 dest_origin = float2(rect.bounds.origin.x, rect.bounds.origin.y);
+  float2 dest_size = max(float2(rect.bounds.size.width, rect.bounds.size.height), float2(1.0));
+  float2 u = clamp((input.position.xy - dest_origin) / dest_size, 0.0, 1.0);
+
+  // Flip per axis. MIRROR_AXIS_HORIZONTAL = bit 0, VERTICAL = bit 1.
+  if ((rect.mirror_axis & 1u) != 0u) {
+    u.x = 1.0 - u.x;
+  }
+  if ((rect.mirror_axis & 2u) != 0u) {
+    u.y = 1.0 - u.y;
+  }
+
+  // Map back to source rect, then to viewport UV.
+  float2 src_origin = float2(rect.source_bounds.origin.x, rect.source_bounds.origin.y);
+  float2 src_size = float2(rect.source_bounds.size.width, rect.source_bounds.size.height);
+  float2 src_pos = src_origin + u * src_size;
+  float2 src_uv = src_pos / viewport_f;
+  // Reject out-of-viewport samples to transparent.
+  if (src_uv.x < 0.0 || src_uv.x > 1.0 || src_uv.y < 0.0 || src_uv.y > 1.0) {
+    return float4(0.0);
+  }
+
+  float strength = gradient_blur_strength(
+    input.position.xy,
+    rect.bounds,
+    rect.blur_radius,
+    rect.blur_radius_end,
+    float2(rect.gradient_direction[0], rect.gradient_direction[1]),
+    scene_blur->max_blur_radius
+  );
+  float4 blurred = blur_input.sample(blur_sampler, src_uv);
+  float4 sharp = unblurred_input.sample(blur_sampler, src_uv);
+  float4 color = mix(sharp, blurred, strength);
+
+  float4 tint_rgba = hsla_to_rgba(rect.tint);
+  color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
+
+  float alpha = color.a;
+  if (rect.clip_to_destination != 0u) {
+    float sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+    const float antialias_threshold = 0.5;
+    float aa = saturate(antialias_threshold - sdf);
+    alpha = color.a * aa;
+  }
+  return float4(color.rgb, alpha);
+}

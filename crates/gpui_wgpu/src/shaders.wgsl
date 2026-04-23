@@ -1404,6 +1404,21 @@ struct LensShape {
     _pad3: f32,
 }
 
+struct MirrorRect {
+    order: u32,
+    kernel_levels: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    source_bounds: Bounds,
+    mirror_axis: u32,
+    clip_to_destination: u32,
+    blur_radius: f32,
+    blur_radius_end: f32,
+    gradient_direction: vec2<f32>,
+    tint: Hsla,
+}
+
 @group(1) @binding(0) var<storage, read> b_blur_rects: array<BlurRect>;
 @group(1) @binding(1) var<storage, read> b_lens_rects: array<LensRect>;
 @group(1) @binding(2) var t_blur_input: texture_2d<f32>;
@@ -1411,6 +1426,7 @@ struct LensShape {
 @group(1) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
 @group(1) @binding(5) var t_unblurred_input: texture_2d<f32>;
 @group(1) @binding(6) var<uniform> scene_blur: SceneBlurParams;
+@group(1) @binding(7) var<storage, read> b_mirror_rects: array<MirrorRect>;
 
 // --- BlurRect: rounded rect that samples the blurred framebuffer ---
 
@@ -1667,4 +1683,75 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     }
 
     return blend_color(color, aa);
+}
+
+// --- MirrorRect: sampled+flipped framebuffer region ---
+
+struct MirrorRectVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) rect_id: u32,
+    @location(1) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_mirror_rect(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32,
+) -> MirrorRectVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let rect = b_mirror_rects[instance_id];
+    var out = MirrorRectVarying();
+    out.position = to_device_position(unit_vertex, rect.bounds);
+    out.rect_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_mirror_rect(input: MirrorRectVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let rect = b_mirror_rects[input.rect_id];
+
+    let dest_origin = rect.bounds.origin;
+    let dest_size = max(rect.bounds.size, vec2<f32>(1.0));
+    var u = clamp((input.position.xy - dest_origin) / dest_size, vec2<f32>(0.0), vec2<f32>(1.0));
+
+    if ((rect.mirror_axis & 1u) != 0u) {
+        u.x = 1.0 - u.x;
+    }
+    if ((rect.mirror_axis & 2u) != 0u) {
+        u.y = 1.0 - u.y;
+    }
+
+    let src_pos = rect.source_bounds.origin + u * rect.source_bounds.size;
+    let src_uv = src_pos / globals.viewport_size;
+    if (src_uv.x < 0.0 || src_uv.x > 1.0 || src_uv.y < 0.0 || src_uv.y > 1.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let strength = gradient_blur_strength(
+        input.position.xy,
+        rect.bounds,
+        rect.blur_radius,
+        rect.blur_radius_end,
+        rect.gradient_direction,
+        scene_blur.max_blur_radius,
+    );
+    let blurred = textureSample(t_blur_input, s_blur_input, src_uv);
+    let sharp = textureSample(t_unblurred_input, s_blur_input, src_uv);
+    var color = mix(sharp, blurred, strength);
+
+    let tint_rgba = hsla_to_rgba(rect.tint);
+    color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
+
+    var alpha = color.a;
+    if (rect.clip_to_destination != 0u) {
+        let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+        let antialias_threshold = 0.5;
+        let aa = saturate(antialias_threshold - sdf);
+        alpha = color.a * aa;
+    }
+    return vec4<f32>(color.rgb, alpha);
 }

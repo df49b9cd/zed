@@ -7,8 +7,9 @@ use crate::{
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LensPrimitive, LensRect, LensShape, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent,
+    LensPrimitive, LensRect, LensShape, LineLayoutIndex, MIRROR_AXIS_HORIZONTAL,
+    MIRROR_AXIS_VERTICAL, MirrorRect, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Radians, Render, RenderGlyphParams, RenderImage, RenderImageParams,
@@ -3541,6 +3542,62 @@ impl Window {
         });
     }
 
+    /// Paint a mirrored slice of the current frame into `destination`. The
+    /// rectangle `source` is read from the framebuffer snapshot, optionally
+    /// flipped horizontally / vertically per `effect.axis`, and composited
+    /// at `destination` with an optional rounded-rect clip and tint.
+    ///
+    /// Used to extend an element beyond its own frame — SwiftUI's
+    /// `backgroundExtensionEffect()` is the direct analogue.
+    ///
+    /// Like `paint_blur_rect` and `paint_lens_rect`, each mirror rect
+    /// forces a render-pass break so the framebuffer can be sampled.
+    pub fn paint_mirror_rect(
+        &mut self,
+        source: Bounds<Pixels>,
+        destination: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        effect: MirrorEffect,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+
+        let (blur_radius, blur_radius_end, gradient_direction, kernel_levels) =
+            if let Some(blur) = effect.blur {
+                (
+                    blur.radius.scale(scale_factor),
+                    blur.radius_end.scale(scale_factor),
+                    blur.gradient_direction,
+                    blur.kernel_levels.clamp(1, 5),
+                )
+            } else {
+                (
+                    ScaledPixels(0.0),
+                    ScaledPixels(0.0),
+                    [0.0, 0.0],
+                    1,
+                )
+            };
+
+        self.next_frame.scene.insert_primitive(MirrorRect {
+            order: 0,
+            kernel_levels,
+            bounds: destination.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            source_bounds: source.scale(scale_factor),
+            mirror_axis: effect.axis.flags(),
+            clip_to_destination: if effect.clip_to_destination { 1 } else { 0 },
+            blur_radius,
+            blur_radius_end,
+            gradient_direction,
+            tint: effect.tint.opacity(opacity),
+        });
+    }
+
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -6254,4 +6311,73 @@ pub struct LensShapeSpec {
     pub bounds: Bounds<Pixels>,
     /// Per-corner radii of this shape in window pixels.
     pub corner_radii: Corners<Pixels>,
+}
+
+/// How [`Window::paint_mirror_rect`] flips the sampled source region before
+/// compositing at the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorAxis {
+    /// Mirror left/right (flip around the vertical axis).
+    Horizontal,
+    /// Mirror top/bottom (flip around the horizontal axis).
+    Vertical,
+    /// Flip both axes — equivalent to a 180° rotation.
+    Both,
+    /// No flip; `paint_mirror_rect` becomes a translated copy of the
+    /// source region.
+    None,
+}
+
+impl MirrorAxis {
+    fn flags(self) -> u32 {
+        match self {
+            MirrorAxis::Horizontal => MIRROR_AXIS_HORIZONTAL,
+            MirrorAxis::Vertical => MIRROR_AXIS_VERTICAL,
+            MirrorAxis::Both => MIRROR_AXIS_HORIZONTAL | MIRROR_AXIS_VERTICAL,
+            MirrorAxis::None => 0,
+        }
+    }
+}
+
+/// Configuration for [`Window::paint_mirror_rect`].
+#[derive(Clone, Copy, Debug)]
+pub struct MirrorEffect {
+    /// How to flip the sampled source region.
+    pub axis: MirrorAxis,
+    /// When `true`, the mirrored sample is masked against the destination's
+    /// rounded-rect SDF so out-of-corner pixels go transparent.
+    pub clip_to_destination: bool,
+    /// Optional backdrop blur applied to the mirrored source. When
+    /// `None`, the un-blurred framebuffer snapshot is sampled directly.
+    pub blur: Option<BlurEffect>,
+    /// Color overlay applied after mirroring.
+    pub tint: Hsla,
+}
+
+impl Default for MirrorEffect {
+    fn default() -> Self {
+        Self {
+            axis: MirrorAxis::Horizontal,
+            clip_to_destination: true,
+            blur: None,
+            tint: transparent_black(),
+        }
+    }
+}
+
+impl MirrorEffect {
+    /// Construct a mirror effect with the given flip axis, clip-to-dest
+    /// enabled, no blur, and no tint.
+    pub fn new(axis: MirrorAxis) -> Self {
+        Self {
+            axis,
+            ..Default::default()
+        }
+    }
+
+    /// Override the blur to apply to the mirrored source.
+    pub fn with_blur(mut self, blur: BlurEffect) -> Self {
+        self.blur = Some(blur);
+        self
+    }
 }

@@ -343,10 +343,14 @@ impl DirectXRenderer {
                     // Not yet implemented on DirectX; tracked as a follow-up.
                     Ok(())
                 }
+                PrimitiveBatch::MirrorRects(_) => {
+                    // Not yet implemented on DirectX; tracked as a follow-up.
+                    Ok(())
+                }
             }
             .context(format!(
                 "scene too large:\
-                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces, {} blur rects, {} lens rects",
+                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces, {} blur rects, {} lens rects, {} mirror rects",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
@@ -357,6 +361,7 @@ impl DirectXRenderer {
                 scene.surfaces.len(),
                 scene.blur_rects.len(),
                 scene.lens_rects.len(),
+                scene.mirror_rects.len(),
             ))?;
         }
         self.present()

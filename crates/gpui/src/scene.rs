@@ -38,6 +38,7 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     pub blur_rects: Vec<BlurRect>,
     pub lens_rects: Vec<LensRect>,
+    pub mirror_rects: Vec<MirrorRect>,
     /// Per-shape data for `LensRect`s that represent a multi-shape union.
     /// Each `LensRect` points at a `shape_offset..shape_offset+shape_count`
     /// slice of this vec. Shapes are never reordered after insertion, so the
@@ -61,6 +62,7 @@ impl Scene {
         self.surfaces.clear();
         self.blur_rects.clear();
         self.lens_rects.clear();
+        self.mirror_rects.clear();
         self.lens_shapes.clear();
     }
 
@@ -140,6 +142,10 @@ impl Scene {
                 self.lens_shapes.extend_from_slice(&lens.shapes);
                 self.lens_rects.push(lens.rect);
             }
+            Primitive::MirrorRect(mirror) => {
+                mirror.order = order;
+                self.mirror_rects.push(*mirror);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -169,12 +175,13 @@ impl Scene {
         self.surfaces.sort_by_key(|surface| surface.order);
         self.blur_rects.sort_by_key(|blur| blur.order);
         self.lens_rects.sort_by_key(|lens| lens.order);
+        self.mirror_rects.sort_by_key(|mirror| mirror.order);
     }
 
-    /// Maximum `kernel_levels` requested by any `BlurRect` or `LensRect`
-    /// in the scene, clamped to `1..=5`. Used by renderers to size the
-    /// dual-Kawase snapshot chain for the frame. Returns 0 when neither
-    /// primitive kind is present.
+    /// Maximum `kernel_levels` requested by any `BlurRect`, `LensRect`, or
+    /// `MirrorRect` in the scene, clamped to `1..=5`. Used by renderers
+    /// to size the dual-Kawase snapshot chain for the frame. Returns 0
+    /// when no blur-consuming primitive is present.
     pub fn max_blur_kernel_levels(&self) -> u32 {
         let blur = self
             .blur_rects
@@ -188,14 +195,21 @@ impl Scene {
             .map(|l| l.kernel_levels)
             .max()
             .unwrap_or(0);
-        blur.max(lens).min(5)
+        let mirror = self
+            .mirror_rects
+            .iter()
+            .filter(|m| m.blur_radius.0 > 0.0 || m.blur_radius_end.0 > 0.0)
+            .map(|m| m.kernel_levels)
+            .max()
+            .unwrap_or(0);
+        blur.max(lens).max(mirror).min(5)
     }
 
-    /// Maximum `blur_radius` requested by any `BlurRect` or `LensRect` in
-    /// the scene. For gradient blurs, considers both endpoints (`radius`
-    /// and `radius_end`) — the bigger of the two determines how much
-    /// blurring the Kawase chain must be able to produce. Zero when
-    /// neither primitive kind is present.
+    /// Maximum `blur_radius` requested by any `BlurRect`, `LensRect`, or
+    /// `MirrorRect` in the scene. For gradient blurs, considers both
+    /// endpoints (`radius` and `radius_end`) — the bigger of the two
+    /// determines how much blurring the Kawase chain must be able to
+    /// produce. Zero when no blur-consuming primitive is present.
     pub fn max_blur_radius(&self) -> ScaledPixels {
         let blur = self
             .blur_rects
@@ -207,7 +221,12 @@ impl Scene {
             .iter()
             .map(|l| l.blur_radius.0.max(l.blur_radius_end.0))
             .fold(0.0_f32, f32::max);
-        ScaledPixels(blur.max(lens))
+        let mirror = self
+            .mirror_rects
+            .iter()
+            .map(|m| m.blur_radius.0.max(m.blur_radius_end.0))
+            .fold(0.0_f32, f32::max);
+        ScaledPixels(blur.max(lens).max(mirror))
     }
 
     #[cfg_attr(
@@ -239,6 +258,8 @@ impl Scene {
             blur_rects_iter: self.blur_rects.iter().peekable(),
             lens_rects_start: 0,
             lens_rects_iter: self.lens_rects.iter().peekable(),
+            mirror_rects_start: 0,
+            mirror_rects_iter: self.mirror_rects.iter().peekable(),
         }
     }
 }
@@ -263,6 +284,7 @@ pub(crate) enum PrimitiveKind {
     Surface,
     BlurRect,
     LensRect,
+    MirrorRect,
 }
 
 pub(crate) enum PaintOperation {
@@ -284,6 +306,7 @@ pub enum Primitive {
     Surface(PaintSurface),
     BlurRect(BlurRect),
     LensRect(LensPrimitive),
+    MirrorRect(MirrorRect),
 }
 
 /// A `LensRect` header paired with its per-shape union inputs. Round-trips
@@ -310,6 +333,7 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BlurRect(blur) => &blur.bounds,
             Primitive::LensRect(lens) => &lens.rect.bounds,
+            Primitive::MirrorRect(mirror) => &mirror.bounds,
         }
     }
 
@@ -325,6 +349,7 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BlurRect(blur) => &blur.content_mask,
             Primitive::LensRect(lens) => &lens.rect.content_mask,
+            Primitive::MirrorRect(mirror) => &mirror.content_mask,
         }
     }
 }
@@ -357,6 +382,8 @@ struct BatchIterator<'a> {
     blur_rects_iter: Peekable<slice::Iter<'a, BlurRect>>,
     lens_rects_start: usize,
     lens_rects_iter: Peekable<slice::Iter<'a, LensRect>>,
+    mirror_rects_start: usize,
+    mirror_rects_iter: Peekable<slice::Iter<'a, MirrorRect>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -397,6 +424,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.lens_rects_iter.peek().map(|l| l.order),
                 PrimitiveKind::LensRect,
+            ),
+            (
+                self.mirror_rects_iter.peek().map(|m| m.order),
+                PrimitiveKind::MirrorRect,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -571,6 +602,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.lens_rects_start = lens_rects_end;
                 Some(PrimitiveBatch::LensRects(lens_rects_start..lens_rects_end))
             }
+            PrimitiveKind::MirrorRect => {
+                let mirror_rects_start = self.mirror_rects_start;
+                let mut mirror_rects_end = mirror_rects_start + 1;
+                self.mirror_rects_iter.next();
+                while self
+                    .mirror_rects_iter
+                    .next_if(|mirror| (mirror.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    mirror_rects_end += 1;
+                }
+                self.mirror_rects_start = mirror_rects_end;
+                Some(PrimitiveBatch::MirrorRects(
+                    mirror_rects_start..mirror_rects_end,
+                ))
+            }
         }
     }
 }
@@ -605,6 +652,7 @@ pub enum PrimitiveBatch {
     Surfaces(Range<usize>),
     BlurRects(Range<usize>),
     LensRects(Range<usize>),
+    MirrorRects(Range<usize>),
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -786,6 +834,57 @@ pub struct LensShape {
 }
 
 const _: () = assert!(std::mem::size_of::<LensShape>() == 48);
+
+/// Bit flag enabling a horizontal (left/right) flip in
+/// [`MirrorRect::mirror_axis`].
+pub const MIRROR_AXIS_HORIZONTAL: u32 = 1 << 0;
+/// Bit flag enabling a vertical (top/bottom) flip in
+/// [`MirrorRect::mirror_axis`]. Combine with
+/// [`MIRROR_AXIS_HORIZONTAL`] to produce a 180° rotation.
+pub const MIRROR_AXIS_VERTICAL: u32 = 1 << 1;
+
+/// A rounded rectangle that samples a region of the framebuffer, optionally
+/// flipped across one or both axes, and composites the result back at a
+/// different location. Used for SwiftUI's `backgroundExtensionEffect()` —
+/// extend an image's edge into a decorative out-of-frame mirror, optionally
+/// blurred with the scene's Kawase chain.
+///
+/// Supports the same uniform-or-gradient blur as [`BlurRect`] /
+/// [`LensRect`]. `blur_radius == 0 && blur_radius_end == 0` samples the
+/// un-blurred framebuffer snapshot directly (no blur).
+///
+/// Like `BlurRect` and `LensRect`, each mirror primitive forces a
+/// render-pass break so the framebuffer can be sampled.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct MirrorRect {
+    pub order: DrawOrder,
+    pub kernel_levels: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub source_bounds: Bounds<ScaledPixels>,
+    /// Bitmask of `MIRROR_AXIS_*` flags. `0` disables flipping; the
+    /// primitive then acts as a relocated copy of `source_bounds`.
+    pub mirror_axis: u32,
+    /// `1` clips the mirrored sample against the rounded-rect SDF so
+    /// out-of-corner pixels go transparent. `0` lets the mirrored
+    /// rectangle bleed into the AA band.
+    pub clip_to_destination: u32,
+    pub blur_radius: ScaledPixels,
+    pub blur_radius_end: ScaledPixels,
+    pub gradient_direction: [f32; 2],
+    pub tint: Hsla,
+}
+
+const _: () = assert!(std::mem::size_of::<MirrorRect>() == 112);
+
+impl From<MirrorRect> for Primitive {
+    fn from(mirror: MirrorRect) -> Self {
+        Primitive::MirrorRect(mirror)
+    }
+}
 
 /// The style of a border.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -1146,7 +1245,10 @@ impl PathVertex<Pixels> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlurRect, LensPrimitive, LensRect, LensShape, PrimitiveBatch, Quad, Scene};
+    use super::{
+        BlurRect, LensPrimitive, LensRect, LensShape, MIRROR_AXIS_HORIZONTAL, MirrorRect,
+        PrimitiveBatch, Quad, Scene,
+    };
     use crate::{
         Background, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, ScaledPixels, point,
         size,
@@ -1427,6 +1529,67 @@ mod tests {
         scene.finish();
 
         assert_eq!(scene.max_blur_radius(), ScaledPixels(24.0));
+    }
+
+    fn make_mirror_rect() -> MirrorRect {
+        MirrorRect {
+            order: 0,
+            kernel_levels: 3,
+            bounds: test_bounds(),
+            content_mask: test_content_mask(),
+            corner_radii: test_corners(),
+            source_bounds: test_bounds(),
+            mirror_axis: MIRROR_AXIS_HORIZONTAL,
+            clip_to_destination: 1,
+            blur_radius: ScaledPixels(0.0),
+            blur_radius_end: ScaledPixels(0.0),
+            gradient_direction: [0.0, 0.0],
+            tint: Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn mirror_rect_round_trip() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(make_mirror_rect());
+        scene.finish();
+
+        assert_eq!(scene.mirror_rects.len(), 1);
+
+        let batches: Vec<_> = scene.batches().collect();
+        assert!(
+            batches
+                .iter()
+                .any(|b| matches!(b, PrimitiveBatch::MirrorRects(r) if r.len() == 1)),
+            "expected a MirrorRects batch of size 1, got {:?}",
+            batches
+        );
+    }
+
+    #[test]
+    fn mirror_rect_with_blur_affects_max_blur_radius() {
+        let mut scene = Scene::default();
+        let mut mirror = make_mirror_rect();
+        mirror.blur_radius = ScaledPixels(18.0);
+        mirror.blur_radius_end = ScaledPixels(30.0);
+        scene.insert_primitive(mirror);
+        scene.finish();
+        assert_eq!(scene.max_blur_radius(), ScaledPixels(30.0));
+        assert_eq!(scene.max_blur_kernel_levels(), 3);
+    }
+
+    #[test]
+    fn mirror_rect_without_blur_contributes_zero_kernel() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(make_mirror_rect());
+        scene.finish();
+        // blur_radius == 0 and blur_radius_end == 0: no Kawase chain needed.
+        assert_eq!(scene.max_blur_kernel_levels(), 0);
     }
 
     #[test]

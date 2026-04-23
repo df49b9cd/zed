@@ -2,8 +2,8 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, BlurRect, Bounds, DevicePixels, GpuSpecs, LensRect, LensShape,
-    MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
-    Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    MirrorRect, MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -113,6 +113,7 @@ struct WgpuPipelines {
     blur_upsample: wgpu::RenderPipeline,
     blur_rect: wgpu::RenderPipeline,
     lens_rect: wgpu::RenderPipeline,
+    mirror_rect: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -123,6 +124,7 @@ struct WgpuBindGroupLayouts {
     blur_io: wgpu::BindGroupLayout,
     blur_rect: wgpu::BindGroupLayout,
     lens_rect: wgpu::BindGroupLayout,
+    mirror_rect: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -841,6 +843,31 @@ impl WgpuRenderer {
             ],
         });
 
+        let mirror_rect = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mirror_rect_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                unblurred_texture_entry,
+                scene_blur_params_entry,
+                storage_buffer_entry(7),
+            ],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
@@ -849,6 +876,7 @@ impl WgpuRenderer {
             blur_io,
             blur_rect,
             lens_rect,
+            mirror_rect,
         }
     }
 
@@ -1190,6 +1218,17 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.lens_rect,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+        let mirror_rect = create_pipeline(
+            "mirror_rect",
+            "vs_mirror_rect",
+            "fs_mirror_rect",
+            &layouts.globals,
+            &layouts.mirror_rect,
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
@@ -1209,6 +1248,7 @@ impl WgpuRenderer {
             blur_upsample,
             blur_rect,
             lens_rect,
+            mirror_rect,
         }
     }
 
@@ -1691,7 +1731,9 @@ impl WgpuRenderer {
                 for batch in scene.batches() {
                     let is_blur_batch = matches!(
                         batch,
-                        PrimitiveBatch::BlurRects(_) | PrimitiveBatch::LensRects(_)
+                        PrimitiveBatch::BlurRects(_)
+                            | PrimitiveBatch::LensRects(_)
+                            | PrimitiveBatch::MirrorRects(_)
                     );
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
@@ -1861,6 +1903,51 @@ impl WgpuRenderer {
                                     &mut instance_offset,
                                     &mut pass,
                                 )
+                            } else {
+                                true
+                            }
+                        }
+                        PrimitiveBatch::MirrorRects(range) => {
+                            let rects = &scene.mirror_rects[range];
+                            if rects.is_empty() {
+                                continue;
+                            }
+
+                            drop(pass);
+
+                            let levels = blur_kernel_levels.max(1);
+                            let did_snapshot = if blur_snapshot_valid {
+                                true
+                            } else {
+                                let ok = self.snapshot_and_blur_frame(
+                                    &mut encoder,
+                                    &frame.texture,
+                                    levels,
+                                    blur_offset_multiplier,
+                                );
+                                if ok {
+                                    blur_snapshot_valid = true;
+                                }
+                                ok
+                            };
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued_mirror"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            if did_snapshot {
+                                self.draw_mirror_rects(rects, &mut instance_offset, &mut pass)
                             } else {
                                 true
                             }
@@ -2394,6 +2481,61 @@ impl WgpuRenderer {
         true
     }
 
+    fn draw_mirror_rects(
+        &self,
+        rects: &[MirrorRect],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+        let data = unsafe { Self::instance_bytes(rects) };
+        let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
+            return false;
+        };
+        let resources = self.resources();
+        let Some(snapshot_view) = resources.blur_chain_views[0].as_ref() else {
+            return true;
+        };
+        let Some(unblurred_view) = resources.framebuffer_snapshot_view.as_ref() else {
+            return true;
+        };
+        let bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mirror_rect_bind_group"),
+                layout: &resources.bind_group_layouts.mirror_rect,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(snapshot_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(unblurred_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: self.instance_binding(offset, size),
+                    },
+                ],
+            });
+        pass.set_pipeline(&resources.pipelines.mirror_rect);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &bind_group, &[]);
+        pass.draw(0..4, 0..rects.len() as u32);
+        true
+    }
+
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
@@ -2893,5 +3035,6 @@ mod tests {
         let _ = &pipelines.blur_upsample;
         let _ = &pipelines.blur_rect;
         let _ = &pipelines.lens_rect;
+        let _ = &pipelines.mirror_rect;
     }
 }
