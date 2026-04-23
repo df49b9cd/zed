@@ -1523,9 +1523,13 @@ fragment float4 lens_rect_fragment(
   float blend_k = max(rect.edge_blend_distance, 0.0);
   bool blend_shapes = blend_k > 0.0 && shape_count > 1u;
 
-  // Pass 1: accumulate per-shape SDFs; pick softmin/hardmin weights and
-  // tracked union SDF.
+  // Pass 1: accumulate per-shape SDFs plus a soft per-shape mask
+  // attenuation (0 outside the shape's own `content_mask`, 1 inside,
+  // with a ~1-pixel feather).
+  const float antialias_threshold = 0.5;
+  Corners_ScaledPixels zero_corners = {0.0, 0.0, 0.0, 0.0};
   float per_shape_sdf[8];
+  float per_shape_mask_attn[8];
   float2 per_shape_dir[8];
   float per_shape_norm_dist[8];
   float min_sdf = 1e20;
@@ -1534,6 +1538,9 @@ fragment float4 lens_rect_fragment(
     float d = quad_sdf(frag_pos, s.bounds, s.corner_radii);
     per_shape_sdf[i] = d;
     min_sdf = min(min_sdf, d);
+
+    float mask_sdf = quad_sdf(frag_pos, s.content_mask, zero_corners);
+    per_shape_mask_attn[i] = saturate(antialias_threshold - mask_sdf);
 
     float2 origin = float2(s.bounds.origin.x, s.bounds.origin.y);
     float2 size = float2(s.bounds.size.width, s.bounds.size.height);
@@ -1548,25 +1555,38 @@ fragment float4 lens_rect_fragment(
 
   float union_sdf;
   float weights[8];
-  float total_weight = 0.0;
+  // Scales the final fragment alpha to fade at per-shape mask boundaries.
+  // 1 when every shape is fully inside its own mask (or no mask in play);
+  // smoothly decreases as shapes' mask edges cross the fragment.
+  float coverage_factor;
   if (blend_shapes) {
-    // Exponential smooth-minimum (polynomial order 8). Each weight is
-    // `exp(-d_i / k)`, normalized so they sum to 1. As `k -> 0` the weight
-    // on the minimum shape approaches 1 — identical to hard union.
+    // Exponential smooth-minimum. Each shape contributes a weight
+    // `mask_attn[i] * exp(-(d_i - min_d) / k)` — masked-out shapes are
+    // pulled toward zero weight, so their neighbors dominate the
+    // refraction / Fresnel blend naturally.
     float min_d = min_sdf;
+    float total_pre = 0.0;
+    float total_masked = 0.0;
     for (uint i = 0u; i < shape_count; ++i) {
-      float w = exp(-(per_shape_sdf[i] - min_d) / blend_k);
-      weights[i] = w;
-      total_weight += w;
+      float pre = exp(-(per_shape_sdf[i] - min_d) / blend_k);
+      float masked = per_shape_mask_attn[i] * pre;
+      weights[i] = masked;
+      total_pre += pre;
+      total_masked += masked;
+    }
+    if (total_masked < 1e-6) {
+      discard_fragment();
     }
     // Softmin value: -k * log(Σ exp(-d_i / k)), shifted by min_d to avoid
-    // overflow. Yields the smooth-min distance used for AA and Fresnel.
-    union_sdf = min_d - blend_k * log(max(total_weight, 1e-6));
-    // Normalize weights.
-    float inv_total = 1.0 / max(total_weight, 1e-6);
+    // overflow. Unmasked sum preserves the geometric union outline even
+    // when one shape is masked out — we only attenuate the alpha and
+    // refraction weights, not the shape boundary itself.
+    union_sdf = min_d - blend_k * log(max(total_pre, 1e-6));
+    float inv_masked = 1.0 / max(total_masked, 1e-6);
     for (uint i = 0u; i < shape_count; ++i) {
-      weights[i] *= inv_total;
+      weights[i] *= inv_masked;
     }
+    coverage_factor = clamp(total_masked / max(total_pre, 1e-6), 0.0, 1.0);
   } else {
     // Single shape or hard union: pick the min-SDF shape deterministically.
     uint winner = 0u;
@@ -1581,10 +1601,13 @@ fragment float4 lens_rect_fragment(
     for (uint i = 0u; i < shape_count; ++i) {
       weights[i] = (i == winner) ? 1.0 : 0.0;
     }
+    coverage_factor = per_shape_mask_attn[winner];
+    if (coverage_factor < 1e-3) {
+      discard_fragment();
+    }
   }
 
-  const float antialias_threshold = 0.5;
-  float aa = saturate(antialias_threshold - union_sdf);
+  float aa = saturate(antialias_threshold - union_sdf) * coverage_factor;
   if (aa <= 0.0) {
     discard_fragment();
   }

@@ -821,16 +821,21 @@ impl From<LensPrimitive> for Primitive {
 /// computes a signed distance to each shape, combines them with a smooth-min
 /// weighted by `LensRect::edge_blend_distance`, and refracts against the
 /// resulting field — letting overlapping shapes visually morph into one.
+///
+/// `content_mask` is applied per-shape: fragments outside the mask get a
+/// soft attenuation applied to the shape's contribution (weight → 0), so
+/// clipped shapes dissolve into their neighbors in the smooth-min union
+/// instead of producing a hard seam at the mask edge.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct LensShape {
     pub bounds: Bounds<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
-    /// Pads the struct to 48 bytes so its WGSL `array<LensShape>` stride
-    /// (rounded to 8-byte alignment for the nested `Bounds` `vec2<f32>`)
-    /// matches the Rust storage-buffer stride.
-    pub _pad: [f32; 4],
+    /// Per-shape clip rectangle. Fragments outside this rect attenuate
+    /// the shape's SDF-union weight to zero (with a ~1-pixel smoothing
+    /// band) so masked-out regions yield to the remaining shapes.
+    pub content_mask: Bounds<ScaledPixels>,
 }
 
 const _: () = assert!(std::mem::size_of::<LensShape>() == 48);
@@ -1318,7 +1323,7 @@ mod tests {
         LensShape {
             bounds: test_bounds(),
             corner_radii: test_corners(),
-            _pad: [0.0; 4],
+            content_mask: test_content_mask().bounds,
         }
     }
 
@@ -1373,6 +1378,26 @@ mod tests {
             "expected a LensRects batch of size 1, got {:?}",
             batches
         );
+    }
+
+    #[test]
+    fn lens_shape_preserves_content_mask() {
+        let mut scene = Scene::default();
+        let mut lens = make_lens_primitive();
+        let custom_mask = Bounds {
+            origin: point(ScaledPixels(5.0), ScaledPixels(10.0)),
+            size: size(ScaledPixels(77.0), ScaledPixels(33.0)),
+        };
+        lens.shapes = vec![LensShape {
+            bounds: test_bounds(),
+            corner_radii: test_corners(),
+            content_mask: custom_mask,
+        }];
+        scene.insert_primitive(lens);
+        scene.finish();
+
+        assert_eq!(scene.lens_shapes.len(), 1);
+        assert_eq!(scene.lens_shapes[0].content_mask, custom_mask);
     }
 
     #[test]

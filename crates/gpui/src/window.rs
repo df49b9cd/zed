@@ -3437,10 +3437,7 @@ impl Window {
         effect: LensEffect,
     ) {
         self.paint_lens_rect_union(
-            [LensShapeSpec {
-                bounds,
-                corner_radii,
-            }],
+            [LensShapeSpec::new(bounds, corner_radii)],
             px(0.0),
             effect,
         );
@@ -3508,12 +3505,23 @@ impl Window {
             size: padded_size,
         };
 
+        // Each shape gets its own content_mask; if the caller didn't
+        // supply one, fall back to the element's content mask. Per-shape
+        // masks are intersected with the element's mask so callers can't
+        // bypass the element clip.
+        let element_mask_bounds = content_mask.bounds;
         let scaled_shapes: Vec<LensShape> = specs
             .into_iter()
-            .map(|spec| LensShape {
-                bounds: spec.bounds.scale(scale_factor),
-                corner_radii: spec.corner_radii.scale(scale_factor),
-                _pad: [0.0; 4],
+            .map(|spec| {
+                let shape_mask = spec
+                    .content_mask
+                    .map(|m| m.intersect(&element_mask_bounds))
+                    .unwrap_or(element_mask_bounds);
+                LensShape {
+                    bounds: spec.bounds.scale(scale_factor),
+                    corner_radii: spec.corner_radii.scale(scale_factor),
+                    content_mask: shape_mask.scale(scale_factor),
+                }
             })
             .collect();
 
@@ -6311,6 +6319,30 @@ pub struct LensShapeSpec {
     pub bounds: Bounds<Pixels>,
     /// Per-corner radii of this shape in window pixels.
     pub corner_radii: Corners<Pixels>,
+    /// Optional per-shape clip. `None` inherits the element's
+    /// `content_mask`. When set, fragments outside this rect softly
+    /// attenuate this shape's contribution to the smooth-min union —
+    /// adjacent shapes in the same group keep rendering normally.
+    pub content_mask: Option<Bounds<Pixels>>,
+}
+
+impl LensShapeSpec {
+    /// Construct a shape spec with no per-shape `content_mask`, inheriting
+    /// the element's clip at paint time.
+    pub fn new(bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) -> Self {
+        Self {
+            bounds,
+            corner_radii,
+            content_mask: None,
+        }
+    }
+
+    /// Chain a per-shape `content_mask` onto this spec. The mask is
+    /// intersected with the element's own `content_mask` at paint time.
+    pub fn with_content_mask(mut self, content_mask: Bounds<Pixels>) -> Self {
+        self.content_mask = Some(content_mask);
+        self
+    }
 }
 
 /// How [`Window::paint_mirror_rect`] flips the sampled source region before

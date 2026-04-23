@@ -1396,12 +1396,11 @@ struct SceneBlurParams {
 struct LensShape {
     bounds: Bounds,
     corner_radii: Corners,
-    // Pads the stride to 48 bytes so the WGSL `array<LensShape>` matches
-    // the Rust side.
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
-    _pad3: f32,
+    // Per-shape clip rectangle. Fragments outside this attenuate the
+    // shape's contribution to the SDF union instead of hard-clipping, so
+    // adjacent shapes in the same lens group don't develop a seam at the
+    // mask edge.
+    content_mask: Bounds,
 }
 
 struct MirrorRect {
@@ -1566,7 +1565,10 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     let blend_k = max(rect.edge_blend_distance, 0.0);
     let blend_shapes = blend_k > 0.0 && shape_count > 1u;
 
+    let antialias_threshold = 0.5;
+    let zero_corners = Corners(0.0, 0.0, 0.0, 0.0);
     var per_shape_sdf: array<f32, 8>;
+    var per_shape_mask_attn: array<f32, 8>;
     var per_shape_dir: array<vec2<f32>, 8>;
     var per_shape_norm_dist: array<f32, 8>;
     var min_sdf: f32 = 1e20;
@@ -1575,6 +1577,9 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         let d = quad_sdf(input.position.xy, s.bounds, s.corner_radii);
         per_shape_sdf[i] = d;
         min_sdf = min(min_sdf, d);
+
+        let mask_sdf = quad_sdf(input.position.xy, s.content_mask, zero_corners);
+        per_shape_mask_attn[i] = saturate(antialias_threshold - mask_sdf);
 
         let center = s.bounds.origin + s.bounds.size * 0.5;
         let half_size = s.bounds.size * 0.5;
@@ -1591,18 +1596,26 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
 
     var union_sdf: f32;
     var weights: array<f32, 8>;
+    var coverage_factor: f32;
     if (blend_shapes) {
-        var total_weight: f32 = 0.0;
+        var total_pre: f32 = 0.0;
+        var total_masked: f32 = 0.0;
         for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
-            let w = exp(-(per_shape_sdf[i] - min_sdf) / blend_k);
-            weights[i] = w;
-            total_weight = total_weight + w;
+            let pre = exp(-(per_shape_sdf[i] - min_sdf) / blend_k);
+            let masked = per_shape_mask_attn[i] * pre;
+            weights[i] = masked;
+            total_pre = total_pre + pre;
+            total_masked = total_masked + masked;
         }
-        union_sdf = min_sdf - blend_k * log(max(total_weight, 1e-6));
-        let inv_total = 1.0 / max(total_weight, 1e-6);
+        if (total_masked < 1e-6) {
+            return vec4<f32>(0.0);
+        }
+        union_sdf = min_sdf - blend_k * log(max(total_pre, 1e-6));
+        let inv_masked = 1.0 / max(total_masked, 1e-6);
         for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
-            weights[i] = weights[i] * inv_total;
+            weights[i] = weights[i] * inv_masked;
         }
+        coverage_factor = clamp(total_masked / max(total_pre, 1e-6), 0.0, 1.0);
     } else {
         var winner: u32 = 0u;
         var min_d: f32 = per_shape_sdf[0];
@@ -1616,10 +1629,13 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
             weights[i] = select(0.0, 1.0, i == winner);
         }
+        coverage_factor = per_shape_mask_attn[winner];
+        if (coverage_factor < 1e-3) {
+            return vec4<f32>(0.0);
+        }
     }
 
-    let antialias_threshold = 0.5;
-    let aa = saturate(antialias_threshold - union_sdf);
+    let aa = saturate(antialias_threshold - union_sdf) * coverage_factor;
     if (aa <= 0.0) {
         return vec4<f32>(0.0);
     }
