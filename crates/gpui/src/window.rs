@@ -3437,6 +3437,12 @@ impl Window {
             effect.light_angle.0.is_finite(),
             "LensEffect::light_angle must be finite"
         );
+        debug_assert!(
+            effect.refraction.is_finite()
+                && effect.depth.is_finite()
+                && effect.dispersion.is_finite(),
+            "LensEffect refraction/depth/dispersion must be finite"
+        );
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
@@ -6034,8 +6040,8 @@ pub struct LensEffect {
     /// Glass thickness, normalized 0..1. Modulates the refraction envelope
     /// — thicker glass bends more.
     pub depth: f32,
-    /// Chromatic aberration amount, normalized 0..1 (1.0 ≈ max CA shift).
-    /// 0 = disabled.
+    /// Chromatic aberration amount, normalized 0..1 (1.0 ≈ 100 px R/B shift
+    /// at the rim). 0 = disabled.
     pub dispersion: f32,
     /// Fresnel edge-highlight band width, in window pixels.
     pub splay: Pixels,
