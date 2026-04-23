@@ -116,7 +116,6 @@ struct WgpuPipelines {
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
     blur_downsample: wgpu::RenderPipeline,
-    blur_upsample: wgpu::RenderPipeline,
     blur_rect: wgpu::RenderPipeline,
     lens_rect: wgpu::RenderPipeline,
     mirror_rect: wgpu::RenderPipeline,
@@ -152,68 +151,90 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
-    /// Dual-Kawase scratch chain. `blur_chain_textures[0]` is surface-sized
-    /// and receives the framebuffer snapshot; each subsequent level is
-    /// half-sized. `BlurEffect::kernel_levels` selects the depth used per
-    /// frame (1..=5).
-    blur_chain_textures: [Option<wgpu::Texture>; BLUR_CHAIN_LEVELS],
-    blur_chain_views: [Option<wgpu::TextureView>; BLUR_CHAIN_LEVELS],
-    /// Preserved downsample pyramid: a single mipmapped texture where mip
-    /// 0 is the un-blurred framebuffer snapshot and each subsequent mip
-    /// holds the Kawase-downsample result of the previous level. Fragment
-    /// shaders sample this with `textureSampleLevel` at fractional LOD to
-    /// produce a per-pixel variable-radius blur.
+    /// Downsample pyramid: a single mipmapped texture where mip 0 is the
+    /// un-blurred framebuffer snapshot and each subsequent mip holds the
+    /// Kawase-downsample result of the previous level. Used as both a
+    /// render target (via per-mip views) and a sampled input (via a
+    /// full-mip view so `fs_blur_rect` / `fs_lens_rect` can pick fractional
+    /// LOD for a per-pixel variable-radius blur).
     blur_pyramid_texture: Option<wgpu::Texture>,
     blur_pyramid_view: Option<wgpu::TextureView>,
-    /// Bind groups pre-built for downsample/upsample passes. Downsample
-    /// pass `i` samples level `i` and writes level `i + 1`; upsample pass
-    /// `i` samples level `i + 1` and writes level `i`.
-    blur_down_bind_groups: [Option<wgpu::BindGroup>; BLUR_CHAIN_LEVELS - 1],
-    blur_up_bind_groups: [Option<wgpu::BindGroup>; BLUR_CHAIN_LEVELS - 1],
+    /// One single-mip view per pyramid level, used both as the render
+    /// target when writing mip `i + 1` and as the sampled input when
+    /// reading mip `i`. A mip-restricted view (`base_mip_level = i`,
+    /// `mip_level_count = 1`) keeps the downsample pass's read/write
+    /// subresources disjoint so wgpu's resource-tracking is satisfied.
+    blur_pyramid_mip_views: [Option<wgpu::TextureView>; BLUR_PYRAMID_LEVELS],
+    /// Bind groups pre-built for downsample passes. Pass `i` samples
+    /// pyramid mip `i` and writes pyramid mip `i + 1`; mips 1..N end up
+    /// populated directly by the render passes, with no intermediate
+    /// inter-texture copies.
+    blur_down_bind_groups: [Option<wgpu::BindGroup>; BLUR_PYRAMID_LEVELS - 1],
     blur_sampler: wgpu::Sampler,
     /// Uniform buffer with per-pass `BlurParams` packed at
     /// `min_uniform_buffer_offset_alignment`-sized strides. Bound with
-    /// dynamic offsets so each of the 2 × `BLUR_CHAIN_LEVELS - 1` passes
-    /// reads its own slot.
+    /// dynamic offsets so each of the `BLUR_PYRAMID_LEVELS - 1` downsample
+    /// passes reads its own slot.
     blur_params_buffer: wgpu::Buffer,
     /// Stride between adjacent `BlurParams` slots in `blur_params_buffer`,
     /// equal to `size_of::<BlurParams>()` rounded up to
     /// `min_uniform_buffer_offset_alignment`.
     blur_params_slot_stride: u64,
+    /// Reusable scratch for packing `BLUR_PARAMS_SLOT_COUNT` slots per
+    /// snapshot. Lives on the renderer so interleaved blur batches in one
+    /// frame don't each allocate their own ~2.5 KB scratch.
+    blur_params_scratch: Vec<u8>,
     /// Scene-wide gradient-blur params; written once per frame.
     scene_blur_params_buffer: wgpu::Buffer,
 }
 
 impl WgpuResources {
-    fn invalidate_intermediate_textures(&mut self) {
+    /// Drop intermediate textures whose dimensions no longer match the
+    /// current surface. When `target_size` matches the dimensions of the
+    /// existing pyramid mip 0, this is a no-op — the textures stay
+    /// allocated and `ensure_intermediate_textures` skips recreation. This
+    /// keeps Android background/rotation churn (where `replace_surface`
+    /// fires frequently at the same geometry) from stutter-allocating a
+    /// full W×H mip-chain every time.
+    fn invalidate_intermediate_textures(&mut self, target_size: (u32, u32)) {
+        let (target_width, target_height) = target_size;
+        let matches_target = |tex: Option<&wgpu::Texture>| -> bool {
+            tex.is_some_and(|t| t.width() == target_width && t.height() == target_height)
+        };
+
+        // Pyramid mip 0 doubles as the size-witness: if its dimensions
+        // still match, every chain / pyramid-view / bind-group allocated
+        // alongside it is also the right size.
+        let keep = matches_target(self.blur_pyramid_texture.as_ref())
+            && matches_target(self.path_intermediate_texture.as_ref());
+        if keep {
+            return;
+        }
+
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
-        for slot in &mut self.blur_chain_textures {
-            *slot = None;
-        }
-        for slot in &mut self.blur_chain_views {
-            *slot = None;
-        }
         self.blur_pyramid_texture = None;
         self.blur_pyramid_view = None;
-        for slot in &mut self.blur_down_bind_groups {
+        for slot in &mut self.blur_pyramid_mip_views {
             *slot = None;
         }
-        for slot in &mut self.blur_up_bind_groups {
+        for slot in &mut self.blur_down_bind_groups {
             *slot = None;
         }
     }
 }
 
-/// Maximum blur chain depth (`kernel_levels` is clamped to this). Each
-/// level is half the resolution of the previous; level 0 is the surface
+/// Maximum blur pyramid depth (`kernel_levels` is clamped to this). Each
+/// mip is half the resolution of the previous; mip 0 is the surface
 /// snapshot.
-const BLUR_CHAIN_LEVELS: usize = 6;
-/// One `BlurParams` slot per Kawase pass (down + up over the transitions
-/// between adjacent chain levels).
-const BLUR_PARAMS_SLOT_COUNT: usize = 2 * (BLUR_CHAIN_LEVELS - 1);
+const BLUR_PYRAMID_LEVELS: usize = 6;
+/// One `BlurParams` slot per Kawase downsample pass between adjacent
+/// pyramid mips. The upsample half of the original Kawase algorithm is
+/// not needed (fragment shaders sample the pyramid mips directly), so
+/// only `BLUR_PYRAMID_LEVELS - 1` slots are required.
+const BLUR_PARAMS_SLOT_COUNT: usize = BLUR_PYRAMID_LEVELS - 1;
 /// Reference blur radius. `BlurEffect::radius` scales the Kawase offset
 /// multiplier linearly relative to this.
 const BLUR_REFERENCE_RADIUS_PX: f32 = 20.0;
@@ -594,15 +615,17 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
-            blur_chain_textures: Default::default(),
-            blur_chain_views: Default::default(),
             blur_pyramid_texture: None,
             blur_pyramid_view: None,
+            blur_pyramid_mip_views: Default::default(),
             blur_down_bind_groups: Default::default(),
-            blur_up_bind_groups: Default::default(),
             blur_sampler,
             blur_params_buffer,
             blur_params_slot_stride,
+            blur_params_scratch: vec![
+                0u8;
+                (blur_params_slot_stride as usize) * BLUR_PARAMS_SLOT_COUNT
+            ],
             scene_blur_params_buffer,
         };
 
@@ -860,8 +883,8 @@ impl WgpuRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                storage_buffer_entry(5),
                 scene_blur_params_entry,
-                storage_buffer_entry(7),
             ],
         });
 
@@ -1195,7 +1218,6 @@ impl WgpuRenderer {
         };
 
         let blur_downsample = make_blur_io_pipeline("blur_downsample", "fs_blur_downsample");
-        let blur_upsample = make_blur_io_pipeline("blur_upsample", "fs_blur_upsample");
 
         let blur_rect = create_pipeline(
             "blur_rect",
@@ -1242,7 +1264,6 @@ impl WgpuRenderer {
             poly_sprites,
             surfaces,
             blur_downsample,
-            blur_upsample,
             blur_rect,
             lens_rect,
             mirror_rect,
@@ -1338,10 +1359,8 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
-            for slot in &resources.blur_chain_textures {
-                if let Some(texture) = slot.as_ref() {
-                    texture.destroy();
-                }
+            if let Some(ref pyramid) = resources.blur_pyramid_texture {
+                pyramid.destroy();
             }
 
             resources
@@ -1351,13 +1370,18 @@ impl WgpuRenderer {
             // Invalidate intermediate textures - they will be lazily recreated
             // in draw() after we confirm the surface is healthy. This avoids
             // panics when the device/surface is in an invalid state during resize.
-            resources.invalidate_intermediate_textures();
+            // Size is guaranteed to differ here (see the outer width/height
+            // guard), so pass the new size through.
+            resources.invalidate_intermediate_textures((
+                surface_config.width,
+                surface_config.height,
+            ));
         }
     }
 
     fn ensure_intermediate_textures(&mut self) {
         let needs_path = self.resources().path_intermediate_texture.is_none();
-        let needs_blur = self.resources().blur_chain_textures[0].is_none();
+        let needs_blur = self.resources().blur_pyramid_texture.is_none();
         if !needs_path && !needs_blur {
             return;
         }
@@ -1387,11 +1411,11 @@ impl WgpuRenderer {
         }
 
         if needs_blur {
-            Self::create_blur_chain(resources, format, width, height);
+            Self::create_blur_pyramid(resources, format, width, height);
         }
     }
 
-    fn create_blur_chain(
+    fn create_blur_pyramid(
         resources: &mut WgpuResources,
         surface_format: wgpu::TextureFormat,
         width: u32,
@@ -1401,47 +1425,17 @@ impl WgpuRenderer {
         // gamma chain in `blur_io_shaders.wgsl` is not double-applied when
         // the surface itself is sRGB. When the surface is already
         // non-sRGB this is a no-op.
-        let chain_format = surface_format.remove_srgb_suffix();
+        let pyramid_format = surface_format.remove_srgb_suffix();
 
-        for level in 0..BLUR_CHAIN_LEVELS {
-            let level_width = (width >> level).max(1);
-            let level_height = (height >> level).max(1);
-            let usage = if level == 0 {
-                wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-            } else {
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
-            };
-            let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(&format!("blur_chain_{level}")),
-                size: wgpu::Extent3d {
-                    width: level_width,
-                    height: level_height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: chain_format,
-                usage,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            resources.blur_chain_textures[level] = Some(texture);
-            resources.blur_chain_views[level] = Some(view);
-        }
-
-        // Preserved downsample pyramid. Mip 0 holds the un-blurred
-        // framebuffer snapshot; each subsequent mip is the Kawase
-        // downsample result of the previous level. A single mipmapped
-        // texture plus trilinear sampling lets the fragment shader pick a
-        // fractional LOD per pixel, producing a smooth variable-radius
-        // blur. Clamp the mip count to what the surface size actually
-        // supports: a 16x16 surface can only host 5 mips, not 6.
+        // Mip 0 holds the un-blurred framebuffer snapshot; each subsequent
+        // mip is the Kawase-downsample result of the previous level. A
+        // single mipmapped texture plus trilinear sampling lets the
+        // fragment shader pick a fractional LOD per pixel. Clamp the mip
+        // count to what the surface size actually supports: a 16x16
+        // surface can only host 5 mips, not 6.
         let min_dim = width.min(height).max(1);
         let max_mips = 32 - min_dim.leading_zeros();
-        let pyramid_mip_count = (BLUR_CHAIN_LEVELS as u32).min(max_mips);
+        let pyramid_mip_count = (BLUR_PYRAMID_LEVELS as u32).min(max_mips);
         let pyramid_texture = resources.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("blur_pyramid"),
             size: wgpu::Extent3d {
@@ -1452,31 +1446,54 @@ impl WgpuRenderer {
             mip_level_count: pyramid_mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: chain_format,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            format: pyramid_format,
+            // `COPY_DST` for the initial frame-to-mip-0 snapshot blit.
+            // `RENDER_ATTACHMENT` because downsample passes render directly
+            // into mips 1..N via per-mip views.
+            // `TEXTURE_BINDING` for both downsample sampling (per-mip views)
+            // and the full-mip view used by `fs_blur_rect` / `fs_lens_rect`.
+            usage: wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let pyramid_view = pyramid_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Single-mip views: each restricted to `base_mip_level = i`,
+        // `mip_level_count = 1`. The downsample pass binds view `i` as
+        // sampled input AND view `i + 1` as render target — different
+        // subresources of the same texture, which wgpu's resource tracker
+        // allows (no read/write aliasing).
+        let mut mip_views: [Option<wgpu::TextureView>; BLUR_PYRAMID_LEVELS] = Default::default();
+        for level in 0..pyramid_mip_count as usize {
+            let view = pyramid_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(&format!("blur_pyramid_mip_{level}")),
+                format: None,
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                aspect: wgpu::TextureAspect::All,
+                base_mip_level: level as u32,
+                mip_level_count: Some(1),
+                base_array_layer: 0,
+                array_layer_count: Some(1),
+                usage: None,
+            });
+            mip_views[level] = Some(view);
+        }
+
         resources.blur_pyramid_texture = Some(pyramid_texture);
         resources.blur_pyramid_view = Some(pyramid_view);
+        resources.blur_pyramid_mip_views = mip_views;
 
-        // Pre-build every bind group for the passes the chain can host.
-        // Each pass reads one level and writes the adjacent level; the
-        // bind-group inputs (source view + sampler + params buffer) are
-        // stable for the lifetime of the chain.
-        for i in 0..BLUR_CHAIN_LEVELS - 1 {
-            let src_view = resources.blur_chain_views[i]
-                .as_ref()
-                .expect("chain view allocated above");
+        // Pre-build one bind group per downsample pass. Pass `i` samples
+        // `mip_views[i]` and writes `mip_views[i + 1]`. Only pairs up to
+        // the actual `pyramid_mip_count - 1` are valid; the rest remain
+        // `None` and callers must not attempt passes past that point.
+        for i in 0..BLUR_PYRAMID_LEVELS - 1 {
+            let Some(src_view) = resources.blur_pyramid_mip_views[i].as_ref() else {
+                break;
+            };
             resources.blur_down_bind_groups[i] =
                 Some(Self::create_blur_io_bind_group(resources, src_view, "blur_down"));
-        }
-        for i in 0..BLUR_CHAIN_LEVELS - 1 {
-            let src_view = resources.blur_chain_views[i + 1]
-                .as_ref()
-                .expect("chain view allocated above");
-            resources.blur_up_bind_groups[i] =
-                Some(Self::create_blur_io_bind_group(resources, src_view, "blur_up"));
         }
     }
 
@@ -1586,8 +1603,9 @@ impl WgpuRenderer {
 
             // TBD. Does retrying more actually help?
             if self.failed_frame_count > 5 {
+                let size = (self.surface_config.width, self.surface_config.height);
                 if let Some(res) = self.resources.as_mut() {
-                    res.invalidate_intermediate_textures();
+                    res.invalidate_intermediate_textures(size);
                 }
                 self.atlas.clear();
                 self.needs_redraw = true;
@@ -1704,7 +1722,7 @@ impl WgpuRenderer {
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
-            // Tracks whether the cached blur chain already reflects the
+            // Tracks whether the cached blur pyramid already reflects the
             // contents of `frame.texture` as of the last non-blur batch.
             // Reset to `false` at frame start and whenever a primitive
             // batch draws to the main target.
@@ -1920,14 +1938,17 @@ impl WgpuRenderer {
 
                             drop(pass);
 
-                            let levels = blur_kernel_levels.max(1);
+                            // Pass `blur_kernel_levels` directly: when no
+                            // primitive in the scene requests blur this is 0,
+                            // and `snapshot_and_blur_frame` then does a
+                            // copy-only fast path for mirror-no-blur batches.
                             let did_snapshot = if blur_snapshot_valid {
                                 true
                             } else {
                                 let ok = self.snapshot_and_blur_frame(
                                     &mut encoder,
                                     &frame.texture,
-                                    levels,
+                                    blur_kernel_levels,
                                     blur_offset_multiplier,
                                 );
                                 if ok {
@@ -2187,17 +2208,17 @@ impl WgpuRenderer {
         }
     }
 
-    /// Copy the current swapchain contents into `blur_chain_textures[0]`
-    /// and run `kernel_levels` downsample + upsample passes (dual-Kawase).
-    /// The blurred result ends up back in `blur_chain_textures[0]`, which
-    /// `fs_blur_rect` / `fs_lens_rect` sample.
+    /// Copy the current swapchain contents into pyramid mip 0, then run
+    /// `kernel_levels` Kawase downsample passes that render directly into
+    /// mips 1..N+1 of the same pyramid. `fs_blur_rect` / `fs_lens_rect`
+    /// subsequently sample the full pyramid at a fractional LOD.
     ///
     /// `offset_multiplier` scales the Kawase tap offset; typically
     /// `BlurEffect::radius / BLUR_REFERENCE_RADIUS_PX`.
     ///
     /// Returns `false` if the platform cannot snapshot the framebuffer
-    /// (COPY_SRC missing) or if scratch textures aren't allocated yet;
-    /// callers should skip the blur/lens draw in that case.
+    /// (COPY_SRC missing) or if the pyramid isn't allocated yet; callers
+    /// should skip the blur/lens draw in that case.
     fn snapshot_and_blur_frame(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -2209,23 +2230,34 @@ impl WgpuRenderer {
             return false;
         }
 
-        let kernel_levels = kernel_levels.clamp(1, (BLUR_CHAIN_LEVELS - 1) as u32) as usize;
+        // `kernel_levels == 0` means no primitive in the scene asked for
+        // blur; skip the Kawase passes and snapshot mip 0 only.
+        let kernel_levels = kernel_levels.min((BLUR_PYRAMID_LEVELS - 1) as u32) as usize;
         self.ensure_intermediate_textures();
 
         let width = self.surface_config.width.max(1);
         let height = self.surface_config.height.max(1);
-        let resources = self.resources();
+        let resources = self.resources_mut();
 
-        if resources.blur_chain_textures[0].is_none() {
+        if resources.blur_pyramid_texture.is_none() {
             return false;
         }
+        // The pyramid may have fewer mips than requested on small surfaces
+        // (see `create_blur_pyramid`'s clamp). Cap the pass count so we
+        // never try to sample or render a mip the pyramid doesn't have.
+        let available_mips = resources
+            .blur_pyramid_texture
+            .as_ref()
+            .map(|t| t.mip_level_count() as usize)
+            .unwrap_or(0);
+        let kernel_levels = kernel_levels.min(available_mips.saturating_sub(1));
 
-        // Pack per-pass BlurParams. Slot layout:
-        //   0..kernel_levels              → downsample passes (i → i+1)
-        //   kernel_levels..2*kernel_levels → upsample passes  (i+1 → i),
-        //                                     iterated back down.
+        // Pack per-pass BlurParams, one slot per downsample pass (`i`
+        // samples pyramid mip `i` and writes pyramid mip `i + 1`).
         let slot_stride = resources.blur_params_slot_stride;
-        let mut slot_bytes = vec![0u8; (slot_stride as usize) * BLUR_PARAMS_SLOT_COUNT];
+        let slot_bytes_len = (slot_stride as usize) * BLUR_PARAMS_SLOT_COUNT;
+        resources.blur_params_scratch.clear();
+        resources.blur_params_scratch.resize(slot_bytes_len, 0);
         let write_slot = |slot_bytes: &mut [u8], slot: usize, params: BlurParams| {
             let offset = slot * slot_stride as usize;
             slot_bytes[offset..offset + std::mem::size_of::<BlurParams>()]
@@ -2235,7 +2267,7 @@ impl WgpuRenderer {
             let src_w = (width >> i).max(1);
             let src_h = (height >> i).max(1);
             write_slot(
-                &mut slot_bytes,
+                &mut resources.blur_params_scratch,
                 i,
                 BlurParams {
                     viewport_size: [src_w as f32, src_h as f32],
@@ -2244,29 +2276,19 @@ impl WgpuRenderer {
                 },
             );
         }
-        for step in 0..kernel_levels {
-            let src_level = kernel_levels - step;
-            let src_w = (width >> src_level).max(1);
-            let src_h = (height >> src_level).max(1);
-            write_slot(
-                &mut slot_bytes,
-                kernel_levels + step,
-                BlurParams {
-                    viewport_size: [src_w as f32, src_h as f32],
-                    offset_multiplier,
-                    pad: 0.0,
-                },
-            );
-        }
-        resources
-            .queue
-            .write_buffer(&resources.blur_params_buffer, 0, &slot_bytes);
+        resources.queue.write_buffer(
+            &resources.blur_params_buffer,
+            0,
+            &resources.blur_params_scratch,
+        );
+        let resources = self.resources();
 
-        let copy_extent = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
+        let pyramid = resources
+            .blur_pyramid_texture
+            .as_ref()
+            .expect("pyramid checked above");
+
+        // Initial snapshot: swapchain → pyramid mip 0.
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: frame_texture,
@@ -2275,40 +2297,29 @@ impl WgpuRenderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: resources.blur_chain_textures[0]
-                    .as_ref()
-                    .expect("chain level 0 checked above"),
+                texture: pyramid,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            copy_extent,
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
-        if let Some(pyramid) = resources.blur_pyramid_texture.as_ref() {
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: frame_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: pyramid,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                copy_extent,
-            );
-        }
 
+        // Kawase downsample: each pass samples pyramid mip `i` via a
+        // single-mip view and renders into pyramid mip `i + 1` via
+        // another single-mip view. Different subresources of the same
+        // texture, which wgpu treats as read/write-disjoint.
         for i in 0..kernel_levels {
-            let dst_view = resources.blur_chain_views[i + 1]
+            let dst_view = resources.blur_pyramid_mip_views[i + 1]
                 .as_ref()
-                .expect("chain view allocated");
+                .expect("pyramid mip view allocated for active pass");
             let bind_group = resources.blur_down_bind_groups[i]
                 .as_ref()
-                .expect("down bind group allocated");
+                .expect("down bind group allocated for active pass");
             let dynamic_offset = (i as u64 * slot_stride) as u32;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blur_downsample_pass"),
@@ -2325,74 +2336,6 @@ impl WgpuRenderer {
                 ..Default::default()
             });
             pass.set_pipeline(&resources.pipelines.blur_downsample);
-            pass.set_bind_group(0, bind_group, &[dynamic_offset]);
-            pass.draw(0..3, 0..1);
-        }
-
-        // Preserve the downsample chain into the pyramid before the
-        // upsample loop overwrites `chain[0..kernel_levels-1]`. Each
-        // `chain[i]` is the /2^i-sized result of `i` Kawase downsample
-        // passes, which maps to pyramid mip level `i`. Clamp the copy
-        // extent to the pyramid mip count in case the surface was too
-        // small to host every mip (ensure_intermediate_textures clamps
-        // pyramid mips based on the surface size).
-        if let Some(pyramid) = resources.blur_pyramid_texture.as_ref() {
-            let pyramid_mip_count = pyramid.mip_level_count();
-            for i in 1..=kernel_levels {
-                if (i as u32) >= pyramid_mip_count {
-                    break;
-                }
-                let chain_texture = resources.blur_chain_textures[i]
-                    .as_ref()
-                    .expect("chain level allocated");
-                let level_width = (width >> i).max(1);
-                let level_height = (height >> i).max(1);
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: chain_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: pyramid,
-                        mip_level: i as u32,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: level_width,
-                        height: level_height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-        }
-
-        for step in 0..kernel_levels {
-            let dst_level = kernel_levels - step - 1;
-            let dst_view = resources.blur_chain_views[dst_level]
-                .as_ref()
-                .expect("chain view allocated");
-            let bind_group = resources.blur_up_bind_groups[dst_level]
-                .as_ref()
-                .expect("up bind group allocated");
-            let dynamic_offset = ((kernel_levels + step) as u64 * slot_stride) as u32;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("blur_upsample_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: dst_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            pass.set_pipeline(&resources.pipelines.blur_upsample);
             pass.set_bind_group(0, bind_group, &[dynamic_offset]);
             pass.draw(0..3, 0..1);
         }
@@ -2544,12 +2487,12 @@ impl WgpuRenderer {
                         resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
+                        binding: 5,
+                        resource: self.instance_binding(offset, size),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: self.instance_binding(offset, size),
+                        binding: 6,
+                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
                     },
                 ],
             });
@@ -2723,8 +2666,9 @@ impl WgpuRenderer {
     pub fn unconfigure_surface(&mut self) {
         self.surface_configured = false;
         // Drop intermediate textures since they reference the old surface size.
+        let size = (self.surface_config.width, self.surface_config.height);
         if let Some(res) = self.resources.as_mut() {
-            res.invalidate_intermediate_textures();
+            res.invalidate_intermediate_textures(size);
         }
     }
 
@@ -2795,8 +2739,11 @@ impl WgpuRenderer {
             surface.configure(&res.device, &self.surface_config);
             res.surface = surface;
 
-            // Invalidate intermediate textures — they'll be recreated lazily.
-            res.invalidate_intermediate_textures();
+            // Invalidate intermediate textures — they'll be recreated lazily
+            // if the new surface geometry differs. Same-size replace_surface
+            // (common on Android rotation back-and-forth) keeps the existing
+            // pyramid + chain so the next frame doesn't stutter.
+            res.invalidate_intermediate_textures((width, height));
         }
 
         self.surface_configured = true;
@@ -3021,7 +2968,7 @@ mod tests {
     }
 
     /// Compiles every render pipeline used by the renderer, including the
-    /// new `blur_downsample` / `blur_upsample` / `blur_rect` / `lens_rect`
+    /// new `blur_downsample` / `blur_rect` / `lens_rect` / `mirror_rect`
     /// ones. Silently skipped locally when no adapter is available; panics
     /// on CI (`CI` env var set) so a missing adapter is loud rather than
     /// hidden in green build output.
@@ -3056,7 +3003,6 @@ mod tests {
         let _ = &pipelines.poly_sprites;
         let _ = &pipelines.surfaces;
         let _ = &pipelines.blur_downsample;
-        let _ = &pipelines.blur_upsample;
         let _ = &pipelines.blur_rect;
         let _ = &pipelines.lens_rect;
         let _ = &pipelines.mirror_rect;

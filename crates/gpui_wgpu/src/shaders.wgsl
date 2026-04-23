@@ -1361,7 +1361,7 @@ struct BlurRect {
     gradient_direction: vec2<f32>,
     tint: Hsla,
     // Aligns the struct stride to 96 bytes (matching the Rust side).
-    _pad_end: vec2<f32>,
+    pad_end: vec2<f32>,
 }
 
 struct LensRect {
@@ -1426,8 +1426,8 @@ struct MirrorRect {
 @group(1) @binding(2) var t_blur_pyramid: texture_2d<f32>;
 @group(1) @binding(3) var s_blur_input: sampler;
 @group(1) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
+@group(1) @binding(5) var<storage, read> b_mirror_rects: array<MirrorRect>;
 @group(1) @binding(6) var<uniform> scene_blur: SceneBlurParams;
-@group(1) @binding(7) var<storage, read> b_mirror_rects: array<MirrorRect>;
 
 // --- BlurRect: rounded rect that samples the blurred framebuffer ---
 
@@ -1464,9 +1464,15 @@ fn gradient_target_radius(
     if (dir_len2 < 1e-6) {
         return radius_start;
     }
+    // Normalize the direction inside the function so the mapping is
+    // magnitude-invariant in `gradient_direction`. Callers already pass a
+    // unit vector today, but clamping the denominator to 1 px while leaving
+    // the numerator unscaled otherwise gives different `t` for scaled
+    // inputs.
+    let dir = gradient_direction * inverseSqrt(dir_len2);
     let local = frag_pos - bounds.origin;
-    let extent = max(dot(bounds.size, gradient_direction), 1.0);
-    let t = clamp(dot(local, gradient_direction) / extent, 0.0, 1.0);
+    let extent = max(dot(bounds.size, dir), 1.0);
+    let t = clamp(dot(local, dir) / extent, 0.0, 1.0);
     return mix(radius_start, radius_end, t);
 }
 
@@ -1567,10 +1573,10 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
 
     let antialias_threshold = 0.5;
     let zero_corners = Corners(0.0, 0.0, 0.0, 0.0);
-    var per_shape_sdf: array<f32, 8>;
-    var per_shape_mask_attn: array<f32, 8>;
-    var per_shape_dir: array<vec2<f32>, 8>;
-    var per_shape_norm_dist: array<f32, 8>;
+    var per_shape_sdf: array<f32, MAX_LENS_SHAPES>;
+    var per_shape_mask_attn: array<f32, MAX_LENS_SHAPES>;
+    var per_shape_dir: array<vec2<f32>, MAX_LENS_SHAPES>;
+    var per_shape_norm_dist: array<f32, MAX_LENS_SHAPES>;
     var min_sdf: f32 = 1e20;
     for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
         let s = b_lens_shapes[rect.shape_offset + i];
@@ -1595,7 +1601,7 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     }
 
     var union_sdf: f32;
-    var weights: array<f32, 8>;
+    var weights: array<f32, MAX_LENS_SHAPES>;
     var coverage_factor: f32;
     if (blend_shapes) {
         var total_pre: f32 = 0.0;
@@ -1612,8 +1618,11 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         }
         union_sdf = min_sdf - blend_k * log(max(total_pre, 1e-6));
         let inv_masked = 1.0 / max(total_masked, 1e-6);
+        // Clamp to [0, 1]: when `total_masked` approaches the 1e-6 floor,
+        // individual masked weights can scale past 1.0 and blow up the
+        // downstream refraction / dispersion vectors.
         for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
-            weights[i] = weights[i] * inv_masked;
+            weights[i] = clamp(weights[i] * inv_masked, 0.0, 1.0);
         }
         coverage_factor = clamp(total_masked / max(total_pre, 1e-6), 0.0, 1.0);
     } else {
@@ -1643,6 +1652,11 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     let depth_scale = clamp(rect.depth * 0.01, 0.0, 1.0);
     var offset_px = vec2<f32>(0.0, 0.0);
     var weighted_norm_dist: f32 = 0.0;
+    // `weighted_dir` is a weighted *sum* of unit directions, not a unit vector.
+    // For a fragment between two shapes whose centers oppose, the sum shrinks
+    // toward zero even when each contribution is strong — which is intentional:
+    // chromatic dispersion should fade in inter-shape seams so R/B collapse
+    // back onto G instead of streaking. Do not renormalize here.
     var weighted_dir = vec2<f32>(0.0, 0.0);
     for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
         let nd = per_shape_norm_dist[i];
@@ -1652,7 +1666,16 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         weighted_dir = weighted_dir + weights[i] * per_shape_dir[i];
     }
     let base_uv = input.position.xy / globals.viewport_size;
-    let refracted_uv = base_uv - offset_px / globals.viewport_size;
+    // Large `refraction` on lens rims can push UVs outside [0,1]. The
+    // pyramid sampler is created with ClampToEdge so stretched-edge pixels
+    // replicate the border rather than wrap across the framebuffer; clamp
+    // explicitly to make the contract visible and survive a future
+    // sampler-state change.
+    let refracted_uv = clamp(
+        base_uv - offset_px / globals.viewport_size,
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+    );
     let target_radius = gradient_target_radius(
         input.position.xy,
         rect.bounds,
@@ -1682,9 +1705,12 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         let edge_dist = abs(union_sdf);
         let edge_falloff = smoothstep(input.edge_band, 0.0, edge_dist);
         let weighted_len = length(weighted_dir);
+        // `select` evaluates both arms, so guard the division with `max`
+        // instead of relying on the predicate. Matches the MSL ?: path.
+        let safe_dir = weighted_dir / max(weighted_len, 1e-4);
         let facing = select(
             1.0,
-            clamp(dot(weighted_dir / weighted_len, input.light_dir), 0.0, 1.0),
+            clamp(dot(safe_dir, input.light_dir), 0.0, 1.0),
             weighted_len > 0.001,
         );
         let edge_glow = edge_falloff * facing * rect.light_intensity;
@@ -1752,12 +1778,11 @@ fn fs_mirror_rect(input: MirrorRectVarying) -> @location(0) vec4<f32> {
     let tint_rgba = hsla_to_rgba(rect.tint);
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
-    var alpha = color.a;
+    var aa_factor = 1.0;
     if (rect.clip_to_destination != 0u) {
         let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
         let antialias_threshold = 0.5;
-        let aa = saturate(antialias_threshold - sdf);
-        alpha = color.a * aa;
+        aa_factor = saturate(antialias_threshold - sdf);
     }
-    return vec4<f32>(color.rgb, alpha);
+    return blend_color(color, aa_factor);
 }

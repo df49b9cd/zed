@@ -1321,25 +1321,6 @@ fragment float4 blur_downsample_fragment(
   return float4(blur_encode_srgb(averaged.rgb), averaged.a);
 }
 
-fragment float4 blur_upsample_fragment(
-  BlurFullscreenVarying input [[stage_in]],
-  texture2d<float> blur_input [[texture(BlurIoInputIndex_InputTexture)]],
-  sampler blur_sampler [[sampler(BlurIoInputIndex_InputSampler)]],
-  constant BlurParams *params [[buffer(BlurIoInputIndex_Params)]]
-) {
-  float2 o = 0.5 / params->viewport_size * params->offset_multiplier;
-  float4 color = blur_sample_linear(blur_input, blur_sampler, input.uv + float2(-o.x,  o.y)) * 2.0;
-  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2( o.x,  o.y)) * 2.0;
-  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2(-o.x, -o.y)) * 2.0;
-  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2( o.x, -o.y)) * 2.0;
-  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2(-o.x * 2.0, 0.0));
-  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2( o.x * 2.0, 0.0));
-  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2(0.0, -o.y * 2.0));
-  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2(0.0,  o.y * 2.0));
-  float4 averaged = color / 12.0;
-  return float4(blur_encode_srgb(averaged.rgb), averaged.a);
-}
-
 // --- BlurRect: rounded rect that samples the blurred framebuffer ---
 
 struct BlurRectVarying {
@@ -1386,10 +1367,13 @@ float gradient_target_radius(
   if (dir_len2 < 1e-6) {
     return radius_start;
   }
+  // Normalize inside so the mapping is magnitude-invariant in
+  // `gradient_direction`; keeps the MSL side bit-identical with WGSL.
+  float2 dir = gradient_direction * rsqrt(dir_len2);
   float2 local = frag_pos - float2(bounds.origin.x, bounds.origin.y);
   float2 size_v = float2(bounds.size.width, bounds.size.height);
-  float extent = max(dot(size_v, gradient_direction), 1.0);
-  float t = clamp(dot(local, gradient_direction) / extent, 0.0, 1.0);
+  float extent = max(dot(size_v, dir), 1.0);
+  float t = clamp(dot(local, dir) / extent, 0.0, 1.0);
   return mix(radius_start, radius_end, t);
 }
 
@@ -1518,7 +1502,7 @@ fragment float4 lens_rect_fragment(
   float2 frag_pos = input.position.xy;
   uint shape_count = rect.shape_count;
   if (shape_count == 0u) {
-    discard_fragment();
+    return float4(0.0, 0.0, 0.0, 0.0);
   }
   float blend_k = max(rect.edge_blend_distance, 0.0);
   bool blend_shapes = blend_k > 0.0 && shape_count > 1u;
@@ -1527,11 +1511,14 @@ fragment float4 lens_rect_fragment(
   // attenuation (0 outside the shape's own `content_mask`, 1 inside,
   // with a ~1-pixel feather).
   const float antialias_threshold = 0.5;
+  // Mirror of `MAX_LENS_SHAPES` in shaders.wgsl / MAX_LENS_SHAPES_PER_GROUP
+  // in window.rs; bumping either requires bumping the others in lockstep.
+  constexpr uint MAX_LENS_SHAPES = 8u;
   Corners_ScaledPixels zero_corners = {0.0, 0.0, 0.0, 0.0};
-  float per_shape_sdf[8];
-  float per_shape_mask_attn[8];
-  float2 per_shape_dir[8];
-  float per_shape_norm_dist[8];
+  float per_shape_sdf[MAX_LENS_SHAPES];
+  float per_shape_mask_attn[MAX_LENS_SHAPES];
+  float2 per_shape_dir[MAX_LENS_SHAPES];
+  float per_shape_norm_dist[MAX_LENS_SHAPES];
   float min_sdf = 1e20;
   for (uint i = 0u; i < shape_count; ++i) {
     LensShape s = shapes[rect.shape_offset + i];
@@ -1554,7 +1541,7 @@ fragment float4 lens_rect_fragment(
   }
 
   float union_sdf;
-  float weights[8];
+  float weights[MAX_LENS_SHAPES];
   // Scales the final fragment alpha to fade at per-shape mask boundaries.
   // 1 when every shape is fully inside its own mask (or no mask in play);
   // smoothly decreases as shapes' mask edges cross the fragment.
@@ -1575,7 +1562,7 @@ fragment float4 lens_rect_fragment(
       total_masked += masked;
     }
     if (total_masked < 1e-6) {
-      discard_fragment();
+      return float4(0.0, 0.0, 0.0, 0.0);
     }
     // Softmin value: -k * log(Σ exp(-d_i / k)), shifted by min_d to avoid
     // overflow. Unmasked sum preserves the geometric union outline even
@@ -1583,8 +1570,11 @@ fragment float4 lens_rect_fragment(
     // refraction weights, not the shape boundary itself.
     union_sdf = min_d - blend_k * log(max(total_pre, 1e-6));
     float inv_masked = 1.0 / max(total_masked, 1e-6);
+    // Clamp to [0, 1]: when `total_masked` approaches the 1e-6 floor,
+    // individual weights can scale past 1.0 and blow up the refraction
+    // accumulator. Matches the WGSL side.
     for (uint i = 0u; i < shape_count; ++i) {
-      weights[i] *= inv_masked;
+      weights[i] = clamp(weights[i] * inv_masked, 0.0, 1.0);
     }
     coverage_factor = clamp(total_masked / max(total_pre, 1e-6), 0.0, 1.0);
   } else {
@@ -1603,13 +1593,13 @@ fragment float4 lens_rect_fragment(
     }
     coverage_factor = per_shape_mask_attn[winner];
     if (coverage_factor < 1e-3) {
-      discard_fragment();
+      return float4(0.0, 0.0, 0.0, 0.0);
     }
   }
 
   float aa = saturate(antialias_threshold - union_sdf) * coverage_factor;
   if (aa <= 0.0) {
-    discard_fragment();
+    return float4(0.0, 0.0, 0.0, 0.0);
   }
 
   // Pass 2: weighted refraction offset. The per-shape parabolic distortion
@@ -1618,6 +1608,10 @@ fragment float4 lens_rect_fragment(
   float depth_scale = clamp(rect.depth * 0.01, 0.0, 1.0);
   float2 offset_px = float2(0.0, 0.0);
   float weighted_norm_dist = 0.0;
+  // `weighted_dir` is a weighted *sum* of unit directions, not a unit
+  // vector. Between shapes with opposing centers it shrinks toward zero,
+  // which fades chromatic dispersion in inter-shape seams. Do not
+  // renormalize — matches WGSL.
   float2 weighted_dir = float2(0.0, 0.0);
   for (uint i = 0u; i < shape_count; ++i) {
     float nd = per_shape_norm_dist[i];
@@ -1627,7 +1621,14 @@ fragment float4 lens_rect_fragment(
     weighted_dir += weights[i] * per_shape_dir[i];
   }
   float2 base_uv = frag_pos / viewport_f;
-  float2 refracted_uv = base_uv - offset_px / viewport_f;
+  // Clamp to [0,1]: strong `refraction` on lens rims can push UVs past
+  // the edge. The pyramid sampler is ClampToEdge, but clamp here too so
+  // a future sampler-state change can't silently wrap across the frame.
+  float2 refracted_uv = clamp(
+      base_uv - offset_px / viewport_f,
+      float2(0.0, 0.0),
+      float2(1.0, 1.0)
+  );
   float target_radius = gradient_target_radius(
     frag_pos,
     rect.bounds,
@@ -1719,7 +1720,7 @@ fragment float4 mirror_rect_fragment(
   // Normalized position within the destination rect.
   float2 dest_origin = float2(rect.bounds.origin.x, rect.bounds.origin.y);
   float2 dest_size = max(float2(rect.bounds.size.width, rect.bounds.size.height), float2(1.0));
-  float2 u = clamp((input.position.xy - dest_origin) / dest_size, 0.0, 1.0);
+  float2 u = clamp((input.position.xy - dest_origin) / dest_size, float2(0.0), float2(1.0));
 
   // Flip per axis. MIRROR_AXIS_HORIZONTAL = bit 0, VERTICAL = bit 1.
   if ((rect.mirror_axis & 1u) != 0u) {
@@ -1736,7 +1737,7 @@ fragment float4 mirror_rect_fragment(
   float2 src_uv = src_pos / viewport_f;
   // Reject out-of-viewport samples to transparent.
   if (src_uv.x < 0.0 || src_uv.x > 1.0 || src_uv.y < 0.0 || src_uv.y > 1.0) {
-    return float4(0.0);
+    return float4(0.0, 0.0, 0.0, 0.0);
   }
 
   float target_radius = gradient_target_radius(
