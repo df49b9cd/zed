@@ -28,6 +28,46 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 
+// Track whether we've already logged the "not implemented on DirectX"
+// warning for each blur-adjacent primitive kind. The full port is tracked
+// separately; until then, we emit one warning per primitive kind per
+// process so the degradation is visible without spamming every frame.
+static BLUR_RECT_NOT_IMPLEMENTED_WARNED: OnceLock<()> = OnceLock::new();
+static LENS_RECT_NOT_IMPLEMENTED_WARNED: OnceLock<()> = OnceLock::new();
+static MIRROR_RECT_NOT_IMPLEMENTED_WARNED: OnceLock<()> = OnceLock::new();
+
+fn warn_once_primitive_unimplemented(
+    cell: &'static OnceLock<()>,
+    primitive: &'static str,
+) {
+    if cell.set(()).is_ok() {
+        log::warn!(
+            "{primitive} is not yet implemented on the DirectX backend; \
+             the backend falls back to a flat tinted rectangle until the \
+             full port lands. Tracked as a follow-up to the blur-primitive PR."
+        );
+    }
+}
+
+/// Build a plain-quad fallback for a blur / lens / mirror rect. Returns a
+/// `Quad` tinted with `tint` and otherwise untouched, so the full port's
+/// missing features (refraction, Fresnel, source-sampling, gradient blur)
+/// degrade to a flat colored rectangle instead of a hole.
+fn fallback_quad(
+    bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    tint: Hsla,
+) -> Quad {
+    Quad {
+        bounds,
+        content_mask,
+        corner_radii,
+        background: Background::from(tint),
+        ..Quad::default()
+    }
+}
+
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
     pub grayscale_enhanced_contrast: f32,
@@ -83,6 +123,11 @@ struct DirectXResources {
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
+    /// Dedicated quad pipeline used only for the BlurRect / LensRect /
+    /// MirrorRect fallback — reuses the quad shader but owns its own buffer
+    /// so it can be refreshed per batch without clobbering `quad_pipeline`'s
+    /// scene-wide contents.
+    blur_fallback_pipeline: PipelineState<Quad>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -335,10 +380,43 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::BlurRects(range) => {
+                    warn_once_primitive_unimplemented(
+                        &BLUR_RECT_NOT_IMPLEMENTED_WARNED,
+                        "BlurRect",
+                    );
+                    let fallback_quads: Vec<Quad> = scene.blur_rects[range]
+                        .iter()
+                        .map(|r| fallback_quad(r.bounds, r.content_mask, r.corner_radii, r.tint))
+                        .collect();
+                    self.draw_fallback_quads(&fallback_quads)
+                }
+                PrimitiveBatch::LensRects(range) => {
+                    warn_once_primitive_unimplemented(
+                        &LENS_RECT_NOT_IMPLEMENTED_WARNED,
+                        "LensRect",
+                    );
+                    let fallback_quads: Vec<Quad> = scene.lens_rects[range]
+                        .iter()
+                        .map(|r| fallback_quad(r.bounds, r.content_mask, Corners::default(), r.tint))
+                        .collect();
+                    self.draw_fallback_quads(&fallback_quads)
+                }
+                PrimitiveBatch::MirrorRects(range) => {
+                    warn_once_primitive_unimplemented(
+                        &MIRROR_RECT_NOT_IMPLEMENTED_WARNED,
+                        "MirrorRect",
+                    );
+                    let fallback_quads: Vec<Quad> = scene.mirror_rects[range]
+                        .iter()
+                        .map(|r| fallback_quad(r.bounds, r.content_mask, r.corner_radii, r.tint))
+                        .collect();
+                    self.draw_fallback_quads(&fallback_quads)
+                }
             }
             .context(format!(
                 "scene too large:\
-                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces, {} blur rects, {} lens rects, {} mirror rects",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
@@ -347,6 +425,9 @@ impl DirectXRenderer {
                 scene.subpixel_sprites.len(),
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
+                scene.blur_rects.len(),
+                scene.lens_rects.len(),
+                scene.mirror_rects.len(),
             ))?;
         }
         self.present()
@@ -491,6 +572,37 @@ impl DirectXRenderer {
             4,
             start as u32,
             len as u32,
+        )
+    }
+
+    /// Draw synthesized quads for the BlurRect / LensRect / MirrorRect
+    /// fallback. Uses a dedicated pipeline so `update_buffer` here does
+    /// not clobber the scene-wide `quad_pipeline` contents that earlier /
+    /// later batches in the same frame still depend on.
+    fn draw_fallback_quads(&mut self, quads: &[Quad]) -> Result<()> {
+        if quads.is_empty() {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.pipelines.blur_fallback_pipeline.update_buffer(
+            &devices.device,
+            &devices.device_context,
+            quads,
+        )?;
+        self.pipelines.blur_fallback_pipeline.draw_range(
+            &devices.device,
+            &devices.device_context,
+            slice::from_ref(
+                &self
+                    .resources
+                    .as_ref()
+                    .context("resources missing")?
+                    .viewport,
+            ),
+            slice::from_ref(&self.globals.global_params_buffer),
+            4,
+            0,
+            quads.len() as u32,
         )
     }
 
@@ -835,6 +947,13 @@ impl DirectXRenderPipelines {
             64,
             create_blend_state(device)?,
         )?;
+        let blur_fallback_pipeline = PipelineState::new(
+            device,
+            "blur_fallback_pipeline",
+            ShaderModule::Quad,
+            16,
+            create_blend_state(device)?,
+        )?;
         let path_rasterization_pipeline = PipelineState::new(
             device,
             "path_rasterization_pipeline",
@@ -881,6 +1000,7 @@ impl DirectXRenderPipelines {
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
+            blur_fallback_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,

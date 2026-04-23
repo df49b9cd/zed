@@ -2,22 +2,25 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
+    AsyncWindowContext, AvailableSpace, Background, BlurRect, BorderStyle, Bounds, BoxShadow,
+    Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
+    LensPrimitive, LensRect, LensShape, LineLayoutIndex, MIRROR_AXIS_HORIZONTAL,
+    MIRROR_AXIS_VERTICAL, MirrorRect, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    PromptLevel, Quad, Radians, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, radians, rems, size,
+    transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -50,7 +53,7 @@ use std::{
     ops::{DerefMut, Range},
     rc::Rc,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
@@ -3382,6 +3385,246 @@ impl Window {
         });
     }
 
+    /// Paint a dual-Kawase backdrop blur behind the given rounded rectangle.
+    /// Samples the framebuffer under `bounds`, blurs it, and composites with
+    /// `effect.tint`. Used for backdrop-blurred materials like Apple's Liquid
+    /// Glass.
+    ///
+    /// Each `paint_blur_rect` call forces the renderer to break the current
+    /// render pass so the framebuffer can be sampled — using many per frame
+    /// is expensive. Prefer one per glass surface.
+    ///
+    /// This method should only be called as part of the paint phase of
+    /// element drawing.
+    pub fn paint_blur_rect(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        effect: BlurEffect,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(BlurRect {
+            order: 0,
+            kernel_levels: effect.kernel_levels.clamp(1, 5),
+            bounds: bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            blur_radius: effect.radius.scale(scale_factor),
+            blur_radius_end: effect.radius_end.scale(scale_factor),
+            gradient_direction: effect.gradient_direction,
+            tint: effect.tint.opacity(opacity),
+            pad_end: [0.0; 2],
+        });
+    }
+
+    /// Paint a Liquid Glass composite behind the given rounded rectangle:
+    /// backdrop blur plus parabolic refraction, chromatic aberration, and a
+    /// directional Fresnel edge glow.
+    ///
+    /// Same render-pass-break caveat as `paint_blur_rect` — keep the number
+    /// of lens rects per frame small.
+    ///
+    /// This method should only be called as part of the paint phase of
+    /// element drawing.
+    pub fn paint_lens_rect(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        effect: LensEffect,
+    ) {
+        self.paint_lens_rect_union(
+            [LensShapeSpec::new(bounds, corner_radii)],
+            px(0.0),
+            effect,
+        );
+    }
+
+    /// Paint a Liquid Glass composite over the union of multiple rounded
+    /// rectangles. Shapes within `edge_blend_distance` of each other morph
+    /// into a single continuous lens via a smooth-minimum of their signed
+    /// distance fields — the GPU-side equivalent of SwiftUI's
+    /// `GlassEffectContainer(spacing:)`.
+    ///
+    /// `edge_blend_distance` is in window pixels (pre-scale) and defines the
+    /// smooth-minimum radius used when merging shapes' SDFs. The union AABB
+    /// is padded by this distance on every side so the merge field has room
+    /// to settle. Negative values are clamped to zero; `0` disables merging
+    /// entirely.
+    ///
+    /// Accepts 1..=`MAX_LENS_SHAPES_PER_GROUP` shapes; violations trip a
+    /// `debug_assert!`.
+    ///
+    /// Same render-pass-break caveat as `paint_blur_rect` — keep the number
+    /// of lens rects per frame small.
+    ///
+    /// This method should only be called as part of the paint phase of
+    /// element drawing.
+    pub fn paint_lens_rect_union(
+        &mut self,
+        shapes: impl IntoIterator<Item = LensShapeSpec>,
+        edge_blend_distance: Pixels,
+        effect: LensEffect,
+    ) {
+        self.invalidator.debug_assert_paint();
+        debug_assert!(
+            effect.light_angle.0.is_finite(),
+            "LensEffect::light_angle must be finite"
+        );
+        debug_assert!(
+            effect.refraction.is_finite()
+                && effect.depth.is_finite()
+                && effect.dispersion.is_finite(),
+            "LensEffect refraction/depth/dispersion must be finite"
+        );
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+
+        let mut specs: SmallVec<[LensShapeSpec; MAX_LENS_SHAPES_PER_GROUP]> =
+            shapes.into_iter().collect();
+        debug_assert!(
+            !specs.is_empty(),
+            "paint_lens_rect_union requires at least one shape"
+        );
+        debug_assert!(
+            specs.len() <= MAX_LENS_SHAPES_PER_GROUP,
+            "paint_lens_rect_union accepts at most {MAX_LENS_SHAPES_PER_GROUP} shapes, got {}",
+            specs.len()
+        );
+        if specs.is_empty() {
+            static EMPTY_WARNED: OnceLock<()> = OnceLock::new();
+            if EMPTY_WARNED.set(()).is_ok() {
+                log::warn!(
+                    "paint_lens_rect_union called with no shapes; the lens will \
+                     not render. Callers filtering dynamic inputs should early-out \
+                     before calling this."
+                );
+            }
+            return;
+        }
+        specs.truncate(MAX_LENS_SHAPES_PER_GROUP);
+
+        let mut union = specs[0].bounds;
+        for spec in specs.iter().skip(1) {
+            union = union.union(&spec.bounds);
+        }
+        let blend = edge_blend_distance.max(px(0.0));
+        let padded_origin = point(union.origin.x - blend, union.origin.y - blend);
+        let padded_size = size(union.size.width + blend * 2.0, union.size.height + blend * 2.0);
+        let padded_bounds = Bounds {
+            origin: padded_origin,
+            size: padded_size,
+        };
+
+        // Each shape gets its own content_mask; if the caller didn't
+        // supply one, fall back to the element's content mask. Per-shape
+        // masks are intersected with the element's mask so callers can't
+        // bypass the element clip.
+        let element_mask_bounds = content_mask.bounds;
+        let scaled_shapes: SmallVec<[LensShape; MAX_LENS_SHAPES_PER_GROUP]> = specs
+            .into_iter()
+            .map(|spec| {
+                let shape_mask = spec
+                    .content_mask
+                    .map(|m| m.intersect(&element_mask_bounds))
+                    .unwrap_or(element_mask_bounds);
+                LensShape {
+                    bounds: spec.bounds.scale(scale_factor),
+                    corner_radii: spec.corner_radii.scale(scale_factor),
+                    content_mask: shape_mask.scale(scale_factor),
+                }
+            })
+            .collect();
+
+        self.next_frame.scene.insert_primitive(LensPrimitive {
+            rect: LensRect {
+                order: 0,
+                kernel_levels: effect.kernel_levels.clamp(1, 5),
+                bounds: padded_bounds.scale(scale_factor),
+                content_mask: content_mask.scale(scale_factor),
+                shape_offset: 0,
+                shape_count: 0,
+                edge_blend_distance: blend.scale(scale_factor),
+                blur_radius: effect.radius.scale(scale_factor),
+                gradient_direction: effect.gradient_direction,
+                blur_radius_end: effect.radius_end.scale(scale_factor),
+                refraction: effect.refraction * 100.0,
+                depth: effect.depth * 100.0,
+                dispersion: effect.dispersion * 100.0,
+                splay: effect.splay.scale(scale_factor),
+                light_angle_radians: effect.light_angle.0,
+                light_intensity: effect.light_intensity,
+                tint: effect.tint.opacity(opacity),
+                pad2: 0.0,
+            },
+            shapes: scaled_shapes,
+        });
+    }
+
+    /// Paint a mirrored slice of the current frame into `destination`. The
+    /// rectangle `source` is read from the framebuffer snapshot, optionally
+    /// flipped horizontally / vertically per `effect.axis`, and composited
+    /// at `destination` with an optional rounded-rect clip and tint.
+    ///
+    /// Used to extend an element beyond its own frame — SwiftUI's
+    /// `backgroundExtensionEffect()` is the direct analogue.
+    ///
+    /// Like `paint_blur_rect` and `paint_lens_rect`, each mirror rect
+    /// forces a render-pass break so the framebuffer can be sampled.
+    ///
+    /// This method should only be called as part of the paint phase of
+    /// element drawing.
+    pub fn paint_mirror_rect(
+        &mut self,
+        source: Bounds<Pixels>,
+        destination: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        effect: MirrorEffect,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+
+        let (blur_radius, blur_radius_end, gradient_direction, kernel_levels) =
+            if let Some(blur) = effect.blur {
+                (
+                    blur.radius.scale(scale_factor),
+                    blur.radius_end.scale(scale_factor),
+                    blur.gradient_direction,
+                    blur.kernel_levels.clamp(1, 5),
+                )
+            } else {
+                (
+                    ScaledPixels(0.0),
+                    ScaledPixels(0.0),
+                    [0.0, 0.0],
+                    1,
+                )
+            };
+
+        self.next_frame.scene.insert_primitive(MirrorRect {
+            order: 0,
+            kernel_levels,
+            bounds: destination.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            source_bounds: source.scale(scale_factor),
+            mirror_axis: effect.axis.flags(),
+            clip_to_destination: if effect.clip_to_destination { 1 } else { 0 },
+            blur_radius,
+            blur_radius_end,
+            gradient_direction,
+            tint: effect.tint.opacity(opacity),
+        });
+    }
+
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -5889,5 +6132,352 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+/// Direction along which a linear-gradient blur fades. Horizontal (leading →
+/// trailing) or Vertical (top → bottom). Used by the `_gradient` builders on
+/// [`BlurEffect`] / [`LensEffect`] when the consumer wants a simple
+/// axis-aligned fade (HIG scroll-edge blur). For diagonal fades, use
+/// [`BlurEffect::with_gradient_direction`] directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlurAxis {
+    /// Left-to-right (+x) fade.
+    Horizontal,
+    /// Top-to-bottom (+y) fade.
+    Vertical,
+}
+
+impl BlurAxis {
+    fn direction(self) -> [f32; 2] {
+        match self {
+            BlurAxis::Horizontal => [1.0, 0.0],
+            BlurAxis::Vertical => [0.0, 1.0],
+        }
+    }
+}
+
+/// A dual-Kawase backdrop blur with tint, applied to a rounded rectangle.
+/// Passed to [`Window::paint_blur_rect`].
+///
+/// Supports either a uniform blur (`radius_end == radius`, no gradient) or a
+/// linear-gradient blur along `gradient_direction` where the per-pixel
+/// strength interpolates from `radius` at the leading edge of the rect to
+/// `radius_end` at the trailing edge. The gradient variant is a
+/// `mix(unblurred, max-blurred, t)` approximation — visually plausible for
+/// HIG scroll-edge fades but not a true Gaussian per-pixel blur.
+#[derive(Clone, Copy, Debug)]
+pub struct BlurEffect {
+    /// Gaussian-equivalent blur radius at the start of the gradient (or the
+    /// uniform radius if `gradient_direction` is zero), in window pixels.
+    pub radius: Pixels,
+    /// Blur radius at the end of the gradient. Equal to `radius` for a
+    /// uniform blur; differs to fade the blur strength along
+    /// `gradient_direction`.
+    pub radius_end: Pixels,
+    /// Normalized 2D axis the gradient runs along. `[0.0, 0.0]` disables the
+    /// gradient (uniform `radius`).
+    pub gradient_direction: [f32; 2],
+    /// Number of Kawase downsample/upsample passes. Higher = wider blur,
+    /// lower = sharper. Clamped to 1..=5 by the renderer. Typical: 3.
+    ///
+    /// Independent of render-pass break cost: each primitive always forces
+    /// exactly one pass break regardless of `kernel_levels` — this only
+    /// controls post-process depth. See [`Window::paint_blur_rect`] for
+    /// the pass-break caveat.
+    pub kernel_levels: u32,
+    /// Colour layered on top of the blurred backdrop.
+    pub tint: Hsla,
+}
+
+impl Default for BlurEffect {
+    fn default() -> Self {
+        Self {
+            radius: px(20.0),
+            radius_end: px(20.0),
+            gradient_direction: [0.0, 0.0],
+            kernel_levels: 3,
+            tint: transparent_black(),
+        }
+    }
+}
+
+impl BlurEffect {
+    /// Construct a uniform blur with HIG defaults (3 Kawase levels, no tint)
+    /// at the given radius.
+    pub fn new(radius: Pixels) -> Self {
+        Self {
+            radius,
+            radius_end: radius,
+            ..Default::default()
+        }
+    }
+
+    /// Construct a linear-gradient blur that fades from `from` to `to` along
+    /// the given [`BlurAxis`].
+    pub fn linear_gradient(from: Pixels, to: Pixels, axis: BlurAxis) -> Self {
+        Self {
+            radius: from,
+            radius_end: to,
+            gradient_direction: axis.direction(),
+            ..Default::default()
+        }
+    }
+
+    /// Override the gradient direction with an arbitrary 2D vector. The
+    /// shader normalizes the input; callers should pass a non-zero vector.
+    pub fn with_gradient_direction(mut self, direction: [f32; 2]) -> Self {
+        self.gradient_direction = direction;
+        self
+    }
+}
+
+/// A Liquid Glass composite (backdrop blur + refraction + chromatic
+/// aberration + Fresnel edge glow), applied to a rounded rectangle. Passed
+/// to [`Window::paint_lens_rect`].
+///
+/// HIG defaults: refraction 1.0, depth 0.16, dispersion 0.0, splay 6 pt,
+/// light angle -45°, light intensity 0.67.
+#[derive(Clone, Copy, Debug)]
+pub struct LensEffect {
+    /// Backdrop-blur radius (start of the gradient, or the uniform radius),
+    /// in window pixels.
+    pub radius: Pixels,
+    /// Backdrop-blur radius at the end of the gradient, in window pixels.
+    /// Equal to `radius` for uniform blur.
+    pub radius_end: Pixels,
+    /// Normalized gradient direction. `[0.0, 0.0]` means uniform blur.
+    pub gradient_direction: [f32; 2],
+    /// Number of Kawase downsample/upsample passes. Higher = wider blur,
+    /// lower = sharper. Clamped to 1..=5 by the renderer. Typical: 3.
+    ///
+    /// Independent of render-pass break cost: each primitive always forces
+    /// exactly one pass break regardless of `kernel_levels` — this only
+    /// controls post-process depth. See [`Window::paint_lens_rect`] for
+    /// the pass-break caveat.
+    pub kernel_levels: u32,
+    /// Parabolic refraction strength, normalized 0..1 (1.0 = HIG full
+    /// strength).
+    pub refraction: f32,
+    /// Glass thickness, normalized 0..1. Modulates the refraction envelope
+    /// — thicker glass bends more.
+    pub depth: f32,
+    /// Chromatic aberration amount, normalized 0..1 (1.0 ≈ 100 px R/B shift
+    /// at the rim). 0 = disabled.
+    pub dispersion: f32,
+    /// Fresnel edge-highlight band width, in window pixels.
+    pub splay: Pixels,
+    /// Light source direction. 0 = +x (right); rotates counterclockwise.
+    /// HIG default = -45° (upper-left quadrant).
+    pub light_angle: Radians,
+    /// Intensity of the Fresnel edge highlight, 0..1.
+    pub light_intensity: f32,
+    /// Colour overlay applied after refraction.
+    pub tint: Hsla,
+}
+
+impl Default for LensEffect {
+    fn default() -> Self {
+        Self {
+            radius: px(20.0),
+            radius_end: px(20.0),
+            gradient_direction: [0.0, 0.0],
+            kernel_levels: 3,
+            refraction: 1.0,
+            depth: 0.16,
+            dispersion: 0.0,
+            splay: px(6.0),
+            light_angle: radians(-std::f32::consts::FRAC_PI_4),
+            light_intensity: 0.67,
+            tint: transparent_black(),
+        }
+    }
+}
+
+impl LensEffect {
+    /// Construct a uniform lens with HIG defaults (3 Kawase levels, full
+    /// refraction, no dispersion, -45° light at 0.67 intensity, no tint) at
+    /// the given blur radius.
+    pub fn new(radius: Pixels) -> Self {
+        Self {
+            radius,
+            radius_end: radius,
+            ..Default::default()
+        }
+    }
+
+    /// Construct a linear-gradient lens that fades the blur strength from
+    /// `from` to `to` along the given [`BlurAxis`]. Other lens parameters
+    /// keep their HIG defaults.
+    pub fn linear_gradient(from: Pixels, to: Pixels, axis: BlurAxis) -> Self {
+        Self {
+            radius: from,
+            radius_end: to,
+            gradient_direction: axis.direction(),
+            ..Default::default()
+        }
+    }
+
+    /// Override the gradient direction with an arbitrary 2D vector.
+    pub fn with_gradient_direction(mut self, direction: [f32; 2]) -> Self {
+        self.gradient_direction = direction;
+        self
+    }
+}
+
+/// Maximum number of shapes in a single [`Window::paint_lens_rect_union`]
+/// call. Kept small so the per-fragment smooth-min loop stays cheap and the
+/// per-primitive GPU shape buffer is bounded.
+pub const MAX_LENS_SHAPES_PER_GROUP: usize = 8;
+
+/// A single rounded-rectangle shape inside a multi-shape lens group. Passed
+/// to [`Window::paint_lens_rect_union`].
+#[derive(Clone, Copy, Debug)]
+pub struct LensShapeSpec {
+    /// Bounds of this shape in window pixels.
+    pub bounds: Bounds<Pixels>,
+    /// Per-corner radii of this shape in window pixels.
+    pub corner_radii: Corners<Pixels>,
+    /// Optional per-shape clip. `None` inherits the element's
+    /// `content_mask`. When set, fragments outside this rect softly
+    /// attenuate this shape's contribution to the smooth-min union —
+    /// adjacent shapes in the same group keep rendering normally.
+    pub content_mask: Option<Bounds<Pixels>>,
+}
+
+impl LensShapeSpec {
+    /// Construct a shape spec with no per-shape `content_mask`, inheriting
+    /// the element's clip at paint time.
+    pub fn new(bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) -> Self {
+        Self {
+            bounds,
+            corner_radii,
+            content_mask: None,
+        }
+    }
+
+    /// Chain a per-shape `content_mask` onto this spec. The mask is
+    /// intersected with the element's own `content_mask` at paint time.
+    pub fn with_content_mask(mut self, content_mask: Bounds<Pixels>) -> Self {
+        self.content_mask = Some(content_mask);
+        self
+    }
+}
+
+/// How [`Window::paint_mirror_rect`] flips the sampled source region before
+/// compositing at the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorAxis {
+    /// Mirror left/right (flip around the vertical axis).
+    Horizontal,
+    /// Mirror top/bottom (flip around the horizontal axis).
+    Vertical,
+    /// Flip both axes — equivalent to a 180° rotation.
+    Both,
+    /// No flip; `paint_mirror_rect` becomes a translated copy of the
+    /// source region.
+    None,
+}
+
+impl MirrorAxis {
+    fn flags(self) -> u32 {
+        match self {
+            MirrorAxis::Horizontal => MIRROR_AXIS_HORIZONTAL,
+            MirrorAxis::Vertical => MIRROR_AXIS_VERTICAL,
+            MirrorAxis::Both => MIRROR_AXIS_HORIZONTAL | MIRROR_AXIS_VERTICAL,
+            MirrorAxis::None => 0,
+        }
+    }
+}
+
+/// Configuration for [`Window::paint_mirror_rect`].
+///
+/// Defaults: horizontal flip, clip-to-destination enabled, no blur, no tint.
+#[derive(Clone, Copy, Debug)]
+pub struct MirrorEffect {
+    /// How to flip the sampled source region.
+    pub axis: MirrorAxis,
+    /// When `true`, the mirrored sample is masked against the destination's
+    /// rounded-rect SDF so out-of-corner pixels go transparent.
+    pub clip_to_destination: bool,
+    /// Optional backdrop blur applied to the mirrored source. When
+    /// `None`, the un-blurred framebuffer snapshot is sampled directly.
+    /// See [`BlurEffect`] for uniform vs. linear-gradient semantics — the
+    /// gradient, if any, is evaluated in destination (not source) space.
+    pub blur: Option<BlurEffect>,
+    /// Color overlay applied after mirroring.
+    pub tint: Hsla,
+}
+
+impl Default for MirrorEffect {
+    fn default() -> Self {
+        Self {
+            axis: MirrorAxis::Horizontal,
+            clip_to_destination: true,
+            blur: None,
+            tint: transparent_black(),
+        }
+    }
+}
+
+impl MirrorEffect {
+    /// Construct a mirror effect with the given flip axis, clip-to-dest
+    /// enabled, no blur, and no tint.
+    pub fn new(axis: MirrorAxis) -> Self {
+        Self {
+            axis,
+            ..Default::default()
+        }
+    }
+
+    /// Override the blur to apply to the mirrored source.
+    pub fn with_blur(mut self, blur: BlurEffect) -> Self {
+        self.blur = Some(blur);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_axis_flags_map_to_expected_bits() {
+        assert_eq!(MirrorAxis::None.flags(), 0);
+        assert_eq!(MirrorAxis::Horizontal.flags(), MIRROR_AXIS_HORIZONTAL);
+        assert_eq!(MirrorAxis::Vertical.flags(), MIRROR_AXIS_VERTICAL);
+        assert_eq!(
+            MirrorAxis::Both.flags(),
+            MIRROR_AXIS_HORIZONTAL | MIRROR_AXIS_VERTICAL,
+        );
+    }
+
+    #[test]
+    fn blur_effect_linear_gradient_sets_axis() {
+        let horizontal = BlurEffect::linear_gradient(px(0.0), px(20.0), BlurAxis::Horizontal);
+        assert_eq!(horizontal.radius, px(0.0));
+        assert_eq!(horizontal.radius_end, px(20.0));
+        assert_eq!(horizontal.gradient_direction, [1.0, 0.0]);
+
+        let vertical = BlurEffect::linear_gradient(px(5.0), px(12.0), BlurAxis::Vertical);
+        assert_eq!(vertical.gradient_direction, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn lens_effect_linear_gradient_sets_axis() {
+        let horizontal = LensEffect::linear_gradient(px(0.0), px(20.0), BlurAxis::Horizontal);
+        assert_eq!(horizontal.radius, px(0.0));
+        assert_eq!(horizontal.radius_end, px(20.0));
+        assert_eq!(horizontal.gradient_direction, [1.0, 0.0]);
+
+        let vertical = LensEffect::linear_gradient(px(5.0), px(12.0), BlurAxis::Vertical);
+        assert_eq!(vertical.gradient_direction, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn with_gradient_direction_overrides_axis() {
+        let effect =
+            BlurEffect::default().with_gradient_direction([0.5f32.sqrt(), 0.5f32.sqrt()]);
+        assert_eq!(effect.gradient_direction, [0.5f32.sqrt(), 0.5f32.sqrt()]);
     }
 }

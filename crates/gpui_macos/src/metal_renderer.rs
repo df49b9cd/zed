@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, Background, BlurRect, Bounds, ContentMask, DevicePixels, LensRect, LensShape,
+    MirrorRect, MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
+    Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -27,7 +27,12 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem, ptr,
+    sync::{Arc, OnceLock},
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -40,6 +45,18 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
 
+static FRAME_SAMPLING_DISABLED_WARNED: OnceLock<()> = OnceLock::new();
+
+fn warn_frame_sampling_disabled() {
+    if FRAME_SAMPLING_DISABLED_WARNED.set(()).is_ok() {
+        log::warn!(
+            "Skipping BlurRect/LensRect/MirrorRect: Metal renderer was constructed \
+             with enable_frame_sampling=false. Re-create the window with frame \
+             sampling enabled to paint these primitives."
+        );
+    }
+}
+
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
 
@@ -49,8 +66,9 @@ pub(crate) unsafe fn new_renderer(
     _native_view: *mut c_void,
     _bounds: gpui::Size<f32>,
     transparent: bool,
+    enable_frame_sampling: bool,
 ) -> Renderer {
-    MetalRenderer::new(context, transparent)
+    MetalRenderer::new(context, transparent, enable_frame_sampling)
 }
 
 pub(crate) struct InstanceBufferPool {
@@ -114,6 +132,10 @@ pub(crate) struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// True when the layer was configured with `framebuffer_only(false)`,
+    /// which is required to sample the framebuffer inside BlurRect /
+    /// LensRect draws. When false those primitives skip rendering.
+    frame_sampling_enabled: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -133,6 +155,34 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    blur_downsample_pipeline_state: metal::RenderPipelineState,
+    blur_rect_pipeline_state: metal::RenderPipelineState,
+    lens_rect_pipeline_state: metal::RenderPipelineState,
+    mirror_rect_pipeline_state: metal::RenderPipelineState,
+    blur_sampler: metal::SamplerState,
+    /// Downsample pyramid: a single mipmapped texture where mip 0 is the
+    /// un-blurred framebuffer snapshot and each subsequent mip holds the
+    /// Kawase-downsample result of the previous level. Written in-place
+    /// by `snapshot_and_blur_frame` using per-mip texture views for the
+    /// sampled input and `RenderPassColorAttachmentDescriptor::set_level`
+    /// for the output. Fragment shaders sample this with
+    /// `textureSampleLevel` at fractional LOD to produce a per-pixel
+    /// variable-radius blur.
+    blur_pyramid_texture: Option<metal::Texture>,
+}
+
+/// Maximum blur pyramid depth (`kernel_levels` is clamped to this).
+const BLUR_PYRAMID_LEVELS: usize = 6;
+/// Reference blur radius. `BlurEffect::radius` scales the Kawase offset
+/// multiplier linearly relative to this.
+const BLUR_REFERENCE_RADIUS_PX: f32 = 20.0;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BlurParams {
+    viewport_size: [f32; 2],
+    offset_multiplier: f32,
+    pad: f32,
 }
 
 #[repr(C)]
@@ -144,8 +194,21 @@ pub struct PathRasterizationVertex {
 }
 
 impl MetalRenderer {
-    /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
-    pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
+    /// Creates a new MetalRenderer with a CAMetalLayer for window-based
+    /// rendering.
+    ///
+    /// `enable_frame_sampling` controls whether the drawable is configured
+    /// so the blit encoder can sample it as the input of the BlurRect /
+    /// LensRect dual-Kawase snapshot. It forces `framebuffer_only(false)`
+    /// for the lifetime of the layer, which disables tile-memory
+    /// optimizations and regresses per-frame cost for windows that never
+    /// paint a blur/lens primitive. Enable it only for windows that
+    /// actually use those primitives.
+    pub fn new(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+        enable_frame_sampling: bool,
+    ) -> Self {
         let device = Self::create_device();
 
         let layer = metal::MetalLayer::new();
@@ -155,9 +218,14 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
-        // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
-        #[cfg(any(test, feature = "test-support"))]
-        layer.set_framebuffer_only(false);
+        let frame_sampling_enabled = enable_frame_sampling || cfg!(any(test, feature = "test-support"));
+        if frame_sampling_enabled {
+            // Required so `snapshot_and_blur_frame` can read the drawable
+            // (and so visual tests can capture screenshots without
+            // ScreenCaptureKit). Disables on-chip tile-memory
+            // optimizations for this layer.
+            layer.set_framebuffer_only(false);
+        }
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
@@ -168,7 +236,13 @@ impl MetalRenderer {
             ];
         }
 
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        Self::new_internal(
+            device,
+            Some(layer),
+            !transparent,
+            frame_sampling_enabled,
+            instance_buffer_pool,
+        )
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -178,7 +252,7 @@ impl MetalRenderer {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
         let device = Self::create_device();
-        Self::new_internal(device, None, true, instance_buffer_pool)
+        Self::new_internal(device, None, true, true, instance_buffer_pool)
     }
 
     fn create_device() -> metal::Device {
@@ -207,6 +281,7 @@ impl MetalRenderer {
         device: metal::Device,
         layer: Option<metal::MetalLayer>,
         opaque: bool,
+        frame_sampling_enabled: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     ) -> Self {
         #[cfg(feature = "runtime_shaders")]
@@ -319,6 +394,51 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let blur_downsample_pipeline_state = build_blur_io_pipeline_state(
+            &device,
+            &library,
+            "blur_downsample",
+            "blur_fullscreen_vertex",
+            "blur_downsample_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let blur_rect_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "blur_rect",
+            "blur_rect_vertex",
+            "blur_rect_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let lens_rect_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "lens_rect",
+            "lens_rect_vertex",
+            "lens_rect_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let mirror_rect_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "mirror_rect",
+            "mirror_rect_vertex",
+            "mirror_rect_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+
+        let blur_sampler = {
+            let desc = metal::SamplerDescriptor::new();
+            desc.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+            desc.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+            // Trilinear filtering between pyramid mip levels is what makes
+            // the per-pixel variable-radius blur smooth.
+            desc.set_mip_filter(metal::MTLSamplerMipFilter::Linear);
+            desc.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
+            desc.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
+            device.new_sampler(&desc)
+        };
+
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
@@ -328,6 +448,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            frame_sampling_enabled,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -347,6 +468,12 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            blur_downsample_pipeline_state,
+            blur_rect_pipeline_state,
+            lens_rect_pipeline_state,
+            mirror_rect_pipeline_state,
+            blur_sampler,
+            blur_pyramid_texture: None,
         }
     }
 
@@ -395,6 +522,7 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            self.blur_pyramid_texture = None;
             return;
         }
 
@@ -423,6 +551,35 @@ impl MetalRenderer {
             self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
         } else {
             self.path_intermediate_msaa_texture = None;
+        }
+
+        if self.frame_sampling_enabled {
+            let width = (size.width.0 as u64).max(1);
+            let height = (size.height.0 as u64).max(1);
+            // Clamp the mip count to what the surface size actually supports:
+            // a 16x16 surface can only host 5 mips, not 6. Metal rejects the
+            // descriptor if we ask for more than min(log2(width), log2(height))
+            // mip levels and returns nil, which subsequent blit / shader
+            // binds then dereference.
+            let min_dim = width.min(height);
+            let max_mips = 64 - min_dim.leading_zeros() as u64;
+            let pyramid_mip_count = (BLUR_PYRAMID_LEVELS as u64).min(max_mips);
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(width);
+            descriptor.set_height(height);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_mipmap_level_count(pyramid_mip_count);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            // `RenderTarget` so the downsample render passes can write mips
+            // 1..N directly via `color_attachment.set_level`. `ShaderRead`
+            // for both the per-pass input view and the fragment shaders'
+            // fractional-LOD sampling.
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            self.blur_pyramid_texture = Some(self.device.new_texture(&descriptor));
+        } else {
+            self.blur_pyramid_texture = None;
         }
     }
 
@@ -751,6 +908,21 @@ impl MetalRenderer {
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
 
+        let blur_kernel_levels = scene.max_blur_kernel_levels();
+        let scene_max_blur_radius = scene.max_blur_radius().0;
+        let blur_offset_multiplier =
+            (scene_max_blur_radius / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
+        let scene_blur_params = SceneBlurParams {
+            max_blur_radius: scene_max_blur_radius,
+            kernel_levels: blur_kernel_levels as f32,
+            _pad: [0.0; 2],
+        };
+        // Tracks whether the Kawase chain already reflects the drawable
+        // contents since the last non-blur batch. Reset to `false` at
+        // frame start and whenever any other primitive writes to the
+        // drawable.
+        let mut blur_snapshot_valid = false;
+
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
@@ -762,6 +934,12 @@ impl MetalRenderer {
         );
 
         for batch in scene.batches() {
+            let is_blur_batch = matches!(
+                batch,
+                PrimitiveBatch::BlurRects(_)
+                    | PrimitiveBatch::LensRects(_)
+                    | PrimitiveBatch::MirrorRects(_)
+            );
             let ok = match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
                     &scene.shadows[range],
@@ -843,11 +1021,157 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                PrimitiveBatch::BlurRects(range) => {
+                    let rects = &scene.blur_rects[range];
+                    if rects.is_empty() {
+                        true
+                    } else if !self.frame_sampling_enabled {
+                        warn_frame_sampling_disabled();
+                        true
+                    } else {
+                        command_encoder.end_encoding();
+                        let did_snapshot = if blur_snapshot_valid {
+                            true
+                        } else {
+                            let ok = self.snapshot_and_blur_frame(
+                                texture,
+                                viewport_size,
+                                blur_kernel_levels,
+                                blur_offset_multiplier,
+                                command_buffer,
+                            );
+                            if ok {
+                                blur_snapshot_valid = true;
+                            }
+                            ok
+                        };
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                        if did_snapshot {
+                            self.draw_blur_rects(
+                                rects,
+                                scene_blur_params,
+                                instance_buffer,
+                                &mut instance_offset,
+                                viewport_size,
+                                command_encoder,
+                            )
+                        } else {
+                            true
+                        }
+                    }
+                }
+                PrimitiveBatch::LensRects(range) => {
+                    let rects = &scene.lens_rects[range];
+                    if rects.is_empty() {
+                        true
+                    } else if !self.frame_sampling_enabled {
+                        warn_frame_sampling_disabled();
+                        true
+                    } else {
+                        command_encoder.end_encoding();
+                        let did_snapshot = if blur_snapshot_valid {
+                            true
+                        } else {
+                            let ok = self.snapshot_and_blur_frame(
+                                texture,
+                                viewport_size,
+                                blur_kernel_levels,
+                                blur_offset_multiplier,
+                                command_buffer,
+                            );
+                            if ok {
+                                blur_snapshot_valid = true;
+                            }
+                            ok
+                        };
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                        if did_snapshot {
+                            self.draw_lens_rects(
+                                rects,
+                                &scene.lens_shapes,
+                                scene_blur_params,
+                                instance_buffer,
+                                &mut instance_offset,
+                                viewport_size,
+                                command_encoder,
+                            )
+                        } else {
+                            true
+                        }
+                    }
+                }
+                PrimitiveBatch::MirrorRects(range) => {
+                    let rects = &scene.mirror_rects[range];
+                    if rects.is_empty() {
+                        true
+                    } else if !self.frame_sampling_enabled {
+                        warn_frame_sampling_disabled();
+                        true
+                    } else {
+                        command_encoder.end_encoding();
+                        // Mirror always needs the un-blurred snapshot;
+                        // also run the Kawase chain so blur-enabled mirror
+                        // rects have a source to mix against.
+                        let did_snapshot = if blur_snapshot_valid {
+                            true
+                        } else {
+                            // `snapshot_and_blur_frame` accepts `levels == 0`
+                            // and skips the Kawase passes; use that fast path
+                            // when no blur-consuming primitive in the scene
+                            // asked for a blur radius.
+                            let ok = self.snapshot_and_blur_frame(
+                                texture,
+                                viewport_size,
+                                blur_kernel_levels,
+                                blur_offset_multiplier,
+                                command_buffer,
+                            );
+                            if ok {
+                                blur_snapshot_valid = true;
+                            }
+                            ok
+                        };
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                        if did_snapshot {
+                            self.draw_mirror_rects(
+                                rects,
+                                scene_blur_params,
+                                instance_buffer,
+                                &mut instance_offset,
+                                viewport_size,
+                                command_encoder,
+                            )
+                        } else {
+                            true
+                        }
+                    }
+                }
             };
             if !ok {
                 command_encoder.end_encoding();
                 anyhow::bail!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} blur rects, {} lens rects, {} mirror rects",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
@@ -855,7 +1179,14 @@ impl MetalRenderer {
                     scene.monochrome_sprites.len(),
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),
+                    scene.blur_rects.len(),
+                    scene.lens_rects.len(),
+                    scene.mirror_rects.len(),
                 );
+            }
+            if !is_blur_batch {
+                // Drawing to the drawable invalidates the cached snapshot.
+                blur_snapshot_valid = false;
             }
         }
 
@@ -1167,6 +1498,375 @@ impl MetalRenderer {
         );
         *instance_offset = next_offset;
 
+        true
+    }
+
+    fn snapshot_and_blur_frame(
+        &self,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        kernel_levels: u32,
+        offset_multiplier: f32,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> bool {
+        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            return false;
+        }
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
+            return false;
+        };
+        let pyramid_mip_count = pyramid.mipmap_level_count() as usize;
+
+        // `kernel_levels == 0` means no primitive in the scene actually
+        // requested blur (e.g., mirror-only batches with zero radius);
+        // skip the Kawase passes entirely and just snapshot mip 0. The
+        // pyramid may have fewer mips than requested on small surfaces
+        // (see `update_path_intermediate_textures`'s clamp), so also cap
+        // to what the pyramid can host.
+        let kernel_levels = (kernel_levels as usize)
+            .min(BLUR_PYRAMID_LEVELS - 1)
+            .min(pyramid_mip_count.saturating_sub(1));
+
+        // Initial snapshot: swapchain → pyramid mip 0.
+        let blit = command_buffer.new_blit_command_encoder();
+        let full_size = metal::MTLSize {
+            width: texture.width(),
+            height: texture.height(),
+            depth: 1,
+        };
+        blit.copy_from_texture(
+            texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            full_size,
+            pyramid,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+
+        // Kawase downsample: each pass samples pyramid mip `i` (via a
+        // single-mip texture view) and renders into pyramid mip `i + 1`
+        // (via `color_attachment.set_level`). Different subresources of
+        // the same texture, which Metal sequences with the implicit
+        // dependency barriers between render command encoders.
+        for i in 0..kernel_levels {
+            let src_view = pyramid.new_texture_view_from_slice(
+                pyramid.pixel_format(),
+                metal::MTLTextureType::D2,
+                NSRange::new(i as u64, 1),
+                NSRange::new(0, 1),
+            );
+            let src_w = ((viewport_size.width.0 as f32) * 0.5f32.powi(i as i32)).max(1.0);
+            let src_h = ((viewport_size.height.0 as f32) * 0.5f32.powi(i as i32)).max(1.0);
+            self.run_blur_pass(
+                command_buffer,
+                &src_view,
+                pyramid,
+                (i + 1) as u64,
+                &self.blur_downsample_pipeline_state,
+                BlurParams {
+                    viewport_size: [src_w, src_h],
+                    offset_multiplier,
+                    pad: 0.0,
+                },
+            );
+        }
+
+        true
+    }
+
+    fn run_blur_pass(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        input: &metal::TextureRef,
+        output: &metal::TextureRef,
+        output_mip_level: u64,
+        pipeline: &metal::RenderPipelineStateRef,
+        params: BlurParams,
+    ) {
+        let descriptor = metal::RenderPassDescriptor::new();
+        let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+        color_attachment.set_texture(Some(output));
+        color_attachment.set_level(output_mip_level);
+        color_attachment.set_load_action(metal::MTLLoadAction::DontCare);
+        color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+        let encoder = command_buffer.new_render_command_encoder(descriptor);
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_fragment_texture(BlurIoInputIndex::InputTexture as u64, Some(input));
+        encoder.set_fragment_sampler_state(
+            BlurIoInputIndex::InputSampler as u64,
+            Some(&self.blur_sampler),
+        );
+        encoder.set_fragment_bytes(
+            BlurIoInputIndex::Params as u64,
+            mem::size_of::<BlurParams>() as u64,
+            &params as *const BlurParams as *const _,
+        );
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+    }
+
+    fn draw_blur_rects(
+        &self,
+        rects: &[BlurRect],
+        scene_blur_params: SceneBlurParams,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
+            return false;
+        };
+        align_offset(instance_offset);
+
+        // Bounds-check and copy the instance data before mutating the
+        // encoder: an overflow early-return otherwise leaves pipeline /
+        // buffer / texture state dirtied for a draw that never runs.
+        let bytes_len = mem::size_of_val(rects);
+        let next_offset = *instance_offset + bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        unsafe {
+            ptr::copy_nonoverlapping(rects.as_ptr() as *const u8, buffer_contents, bytes_len);
+        }
+
+        command_encoder.set_render_pipeline_state(&self.blur_rect_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BlurRectInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            BlurRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            BlurRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            BlurRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            BlurRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            BlurRectInputIndex::SceneBlurParams as u64,
+            mem::size_of::<SceneBlurParams>() as u64,
+            &scene_blur_params as *const SceneBlurParams as *const _,
+        );
+        command_encoder
+            .set_fragment_texture(BlurRectInputIndex::BlurPyramid as u64, Some(pyramid));
+        command_encoder.set_fragment_sampler_state(
+            BlurRectInputIndex::BlurSampler as u64,
+            Some(&self.blur_sampler),
+        );
+
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            rects.len() as u64,
+        );
+        *instance_offset = next_offset;
+        true
+    }
+
+    fn draw_lens_rects(
+        &self,
+        rects: &[LensRect],
+        shapes: &[LensShape],
+        scene_blur_params: SceneBlurParams,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+        // Shapes cannot be empty if any rect references them; fail rather
+        // than bind a zero-length buffer (Metal doesn't accept that).
+        if shapes.is_empty() {
+            return false;
+        }
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
+            return false;
+        };
+        align_offset(instance_offset);
+        let rects_offset = *instance_offset;
+        let rects_bytes = mem::size_of_val(rects);
+        let after_rects = rects_offset + rects_bytes;
+        if after_rects > instance_buffer.size {
+            return false;
+        }
+        unsafe {
+            let dst =
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(rects_offset);
+            ptr::copy_nonoverlapping(rects.as_ptr() as *const u8, dst, rects_bytes);
+        }
+
+        let mut shapes_offset = after_rects;
+        align_offset(&mut shapes_offset);
+        let shapes_bytes = mem::size_of_val(shapes);
+        let after_shapes = shapes_offset + shapes_bytes;
+        if after_shapes > instance_buffer.size {
+            return false;
+        }
+        unsafe {
+            let dst =
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(shapes_offset);
+            ptr::copy_nonoverlapping(shapes.as_ptr() as *const u8, dst, shapes_bytes);
+        }
+
+        command_encoder.set_render_pipeline_state(&self.lens_rect_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            LensRectInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            LensRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            rects_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            LensRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            rects_offset as u64,
+        );
+        command_encoder.set_vertex_buffer(
+            LensRectInputIndex::Shapes as u64,
+            Some(&instance_buffer.metal_buffer),
+            shapes_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            LensRectInputIndex::Shapes as u64,
+            Some(&instance_buffer.metal_buffer),
+            shapes_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            LensRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            LensRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            LensRectInputIndex::SceneBlurParams as u64,
+            mem::size_of::<SceneBlurParams>() as u64,
+            &scene_blur_params as *const SceneBlurParams as *const _,
+        );
+        command_encoder
+            .set_fragment_texture(LensRectInputIndex::BlurPyramid as u64, Some(pyramid));
+        command_encoder.set_fragment_sampler_state(
+            LensRectInputIndex::BlurSampler as u64,
+            Some(&self.blur_sampler),
+        );
+
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            rects.len() as u64,
+        );
+        *instance_offset = after_shapes;
+        true
+    }
+
+    fn draw_mirror_rects(
+        &self,
+        rects: &[MirrorRect],
+        scene_blur_params: SceneBlurParams,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
+            return false;
+        };
+        align_offset(instance_offset);
+
+        // Bounds-check and copy before touching the encoder state.
+        let bytes_len = mem::size_of_val(rects);
+        let next_offset = *instance_offset + bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        unsafe {
+            let dst = (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset);
+            ptr::copy_nonoverlapping(rects.as_ptr() as *const u8, dst, bytes_len);
+        }
+
+        command_encoder.set_render_pipeline_state(&self.mirror_rect_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            MirrorRectInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            MirrorRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            MirrorRectInputIndex::Rects as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            MirrorRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            MirrorRectInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            MirrorRectInputIndex::SceneBlurParams as u64,
+            mem::size_of::<SceneBlurParams>() as u64,
+            &scene_blur_params as *const SceneBlurParams as *const _,
+        );
+        command_encoder
+            .set_fragment_texture(MirrorRectInputIndex::BlurPyramid as u64, Some(pyramid));
+        command_encoder.set_fragment_sampler_state(
+            MirrorRectInputIndex::BlurSampler as u64,
+            Some(&self.blur_sampler),
+        );
+
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            rects.len() as u64,
+        );
+        *instance_offset = next_offset;
         true
     }
 
@@ -1576,6 +2276,34 @@ fn build_path_sprite_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+fn build_blur_io_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating blur-io vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating blur-io fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create blur-io pipeline state")
+}
+
 fn build_path_rasterization_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -1666,6 +2394,64 @@ enum PathRasterizationInputIndex {
     ViewportSize = 1,
 }
 
+#[repr(C)]
+enum BlurIoInputIndex {
+    Params = 0,
+    InputTexture = 1,
+    InputSampler = 2,
+}
+
+#[repr(C)]
+enum BlurRectInputIndex {
+    Vertices = 0,
+    Rects = 1,
+    ViewportSize = 2,
+    /// Mipmapped pyramid: mip 0 is un-blurred, each subsequent mip is a
+    /// Kawase downsample step. The fragment shader picks a fractional
+    /// LOD based on per-pixel target blur radius.
+    BlurPyramid = 3,
+    BlurSampler = 4,
+    SceneBlurParams = 5,
+}
+
+#[repr(C)]
+enum LensRectInputIndex {
+    Vertices = 0,
+    Rects = 1,
+    ViewportSize = 2,
+    BlurPyramid = 3,
+    BlurSampler = 4,
+    Shapes = 5,
+    SceneBlurParams = 6,
+}
+
+#[repr(C)]
+enum MirrorRectInputIndex {
+    Vertices = 0,
+    Rects = 1,
+    ViewportSize = 2,
+    BlurPyramid = 3,
+    BlurSampler = 4,
+    SceneBlurParams = 5,
+}
+
+/// Scene-wide blur parameters that the gradient-blur shaders use to
+/// compute a per-pixel mip level into the preserved downsample pyramid.
+/// Written once per frame and bound to every blur-consuming pipeline.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SceneBlurParams {
+    /// Maximum `blur_radius` anywhere in the scene (see
+    /// `Scene::max_blur_radius`). The per-pixel `target_radius / max`
+    /// ratio becomes the `strength` input to the log2 mip-level formula.
+    max_blur_radius: f32,
+    /// Number of Kawase downsample passes actually run this frame, as an
+    /// `f32` for the shader's `log2(strength)` clamping math. Matches
+    /// `Scene::max_blur_kernel_levels`.
+    kernel_levels: f32,
+    _pad: [f32; 2],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct PathSprite {
@@ -1705,5 +2491,36 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Constructs a headless `MetalRenderer` and asserts every pipeline
+    /// state allocated during `new_internal` is non-null. This is the
+    /// Metal-side analogue of `pipeline_creation_smoke` in the wgpu
+    /// crate: a broken entry-point name in `shaders.metal` (or missing
+    /// `LensRectInputIndex` binding slot) fails the test at construct
+    /// time rather than the first real draw.
+    #[test]
+    fn pipeline_creation_smoke() {
+        if metal::Device::system_default().is_none() {
+            if std::env::var("CI").is_ok() {
+                panic!("pipeline_creation_smoke requires a Metal device on CI");
+            }
+            eprintln!("skipping pipeline_creation_smoke: no Metal device available");
+            return;
+        }
+        let instance_buffer_pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let renderer = MetalRenderer::new_headless(instance_buffer_pool);
+
+        // Touch each new pipeline field so a missing entry point or a
+        // linker failure surfaces here rather than on the first draw.
+        let _ = renderer.blur_downsample_pipeline_state.as_ptr();
+        let _ = renderer.blur_rect_pipeline_state.as_ptr();
+        let _ = renderer.lens_rect_pipeline_state.as_ptr();
+        let _ = renderer.mirror_rect_pipeline_state.as_ptr();
     }
 }

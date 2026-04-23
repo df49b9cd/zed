@@ -1258,9 +1258,506 @@ float4 fill_color(Background background,
         
         color = solid_color;
         color.a *= saturate(should_be_colored);
-        break; 
+        break;
     }
   }
 
   return color;
+}
+
+// ============================================================================
+// Dual-Kawase blur inner passes (Marius Bjorge, ARM, SIGGRAPH 2015) and the
+// BlurRect / LensRect composite pipelines. Mirrors the WGSL implementation in
+// `gpui_wgpu/src/blur_io_shaders.wgsl` and the blur/lens entry points in
+// `gpui_wgpu/src/shaders.wgsl`.
+// ============================================================================
+
+struct BlurParams {
+  float2 viewport_size;
+  float offset_multiplier;
+  float pad;
+};
+
+struct BlurFullscreenVarying {
+  float4 position [[position]];
+  float2 uv;
+};
+
+// Fullscreen-triangle vertex shader (3 vertices cover the NDC [-1,1] square).
+vertex BlurFullscreenVarying blur_fullscreen_vertex(uint vertex_id [[vertex_id]]) {
+  BlurFullscreenVarying out;
+  float2 uv = float2(float((vertex_id << 1u) & 2u), float(vertex_id & 2u));
+  out.uv = float2(uv.x, 1.0 - uv.y);
+  out.position = float4(uv * 2.0 - float2(1.0, 1.0), 0.0, 1.0);
+  return out;
+}
+
+static float3 blur_linearize(float3 c) {
+  return pow(c, float3(2.2));
+}
+
+static float3 blur_encode_srgb(float3 c) {
+  return pow(c, float3(1.0 / 2.2));
+}
+
+static float4 blur_sample_linear(texture2d<float> tex, sampler smp, float2 uv) {
+  float4 s = tex.sample(smp, uv);
+  return float4(blur_linearize(s.rgb), s.a);
+}
+
+fragment float4 blur_downsample_fragment(
+  BlurFullscreenVarying input [[stage_in]],
+  texture2d<float> blur_input [[texture(BlurIoInputIndex_InputTexture)]],
+  sampler blur_sampler [[sampler(BlurIoInputIndex_InputSampler)]],
+  constant BlurParams *params [[buffer(BlurIoInputIndex_Params)]]
+) {
+  float2 o = 0.5 / params->viewport_size * params->offset_multiplier;
+  float4 color = blur_sample_linear(blur_input, blur_sampler, input.uv) * 4.0;
+  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2(-o.x, -o.y));
+  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2( o.x, -o.y));
+  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2(-o.x,  o.y));
+  color += blur_sample_linear(blur_input, blur_sampler, input.uv + float2( o.x,  o.y));
+  float4 averaged = color / 8.0;
+  return float4(blur_encode_srgb(averaged.rgb), averaged.a);
+}
+
+// --- BlurRect: rounded rect that samples the blurred framebuffer ---
+
+struct BlurRectVarying {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BlurRectFragmentInput {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex BlurRectVarying blur_rect_vertex(
+  uint unit_vertex_id [[vertex_id]],
+  uint rect_id [[instance_id]],
+  constant float2 *unit_vertices [[buffer(BlurRectInputIndex_Vertices)]],
+  constant BlurRect *rects [[buffer(BlurRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(BlurRectInputIndex_ViewportSize)]]
+) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BlurRect rect = rects[rect_id];
+  BlurRectVarying out;
+  out.position = to_device_position(unit_vertex, rect.bounds, viewport_size);
+  out.rect_id = rect_id;
+  float4 clip = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask.bounds);
+  out.clip_distance[0] = clip.x;
+  out.clip_distance[1] = clip.y;
+  out.clip_distance[2] = clip.z;
+  out.clip_distance[3] = clip.w;
+  return out;
+}
+
+// Compute the per-pixel target blur radius for a linear-gradient blur.
+// Uniform-blur paths (gradient_direction == 0) return `radius_start`.
+float gradient_target_radius(
+    float2 frag_pos,
+    Bounds_ScaledPixels bounds,
+    float radius_start,
+    float radius_end,
+    float2 gradient_direction
+) {
+  float dir_len2 = dot(gradient_direction, gradient_direction);
+  if (dir_len2 < 1e-6) {
+    return radius_start;
+  }
+  // Normalize inside so the mapping is magnitude-invariant in
+  // `gradient_direction`; keeps the MSL side bit-identical with WGSL.
+  float2 dir = gradient_direction * rsqrt(dir_len2);
+  float2 local = frag_pos - float2(bounds.origin.x, bounds.origin.y);
+  float2 size_v = float2(bounds.size.width, bounds.size.height);
+  float extent = max(dot(size_v, dir), 1.0);
+  float t = clamp(dot(local, dir) / extent, 0.0, 1.0);
+  return mix(radius_start, radius_end, t);
+}
+
+// Sample the preserved Kawase downsample pyramid at a per-pixel blur
+// radius. Mip level 0 is the un-blurred framebuffer; each subsequent mip
+// is a /2-sized Kawase downsample of the previous, so the effective
+// Gaussian sigma roughly doubles per level. Choosing
+// `level = kernel_levels + log2(strength)` matches this exponential
+// spacing — doubling the target radius bumps level by 1 — and trilinear
+// filtering between mips produces a smooth per-pixel variable-radius
+// blur.
+float4 sample_blur_pyramid(
+    texture2d<float> pyramid,
+    sampler pyramid_sampler,
+    float2 uv,
+    float target_radius,
+    constant SceneBlurParams *scene_blur
+) {
+  if (scene_blur->max_blur_radius <= 0.0) {
+    return pyramid.sample(pyramid_sampler, uv, level(0.0));
+  }
+  float strength = clamp(target_radius / scene_blur->max_blur_radius, 0.0, 1.0);
+  float level_f = scene_blur->kernel_levels + log2(max(strength, 1e-6));
+  level_f = clamp(level_f, 0.0, scene_blur->kernel_levels);
+  return pyramid.sample(pyramid_sampler, uv, level(level_f));
+}
+
+fragment float4 blur_rect_fragment(
+  BlurRectFragmentInput input [[stage_in]],
+  constant BlurRect *rects [[buffer(BlurRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(BlurRectInputIndex_ViewportSize)]],
+  texture2d<float> blur_pyramid [[texture(BlurRectInputIndex_BlurPyramid)]],
+  sampler blur_sampler [[sampler(BlurRectInputIndex_BlurSampler)]],
+  constant SceneBlurParams *scene_blur [[buffer(BlurRectInputIndex_SceneBlurParams)]]
+) {
+  BlurRect rect = rects[input.rect_id];
+  float2 viewport_f = float2((float)viewport_size->width, (float)viewport_size->height);
+  float2 fb_uv = input.position.xy / viewport_f;
+  float target_radius = gradient_target_radius(
+    input.position.xy,
+    rect.bounds,
+    rect.blur_radius,
+    rect.blur_radius_end,
+    float2(rect.gradient_direction[0], rect.gradient_direction[1])
+  );
+  float4 color = sample_blur_pyramid(blur_pyramid, blur_sampler, fb_uv, target_radius, scene_blur);
+  float4 tint_rgba = hsla_to_rgba(rect.tint);
+  color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
+
+  float sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+  const float antialias_threshold = 0.5;
+  float aa = saturate(antialias_threshold - sdf);
+  return float4(color.rgb, color.a * aa);
+}
+
+// --- LensRect: Liquid Glass composite (refraction + CA + Fresnel) ---
+//
+// Multi-shape lens: the fragment loops over
+// `rect.shape_offset..shape_offset + shape_count` in the `shapes` storage
+// buffer, computing a per-shape SDF + parabolic refraction direction, then
+// smooth-min-blends them by `rect.edge_blend_distance` so overlapping shapes
+// morph into one continuous lens.
+
+struct LensRectVarying {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+  float2 light_dir [[flat]];
+  float edge_band [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct LensRectFragmentInput {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+  float2 light_dir [[flat]];
+  float edge_band [[flat]];
+};
+
+vertex LensRectVarying lens_rect_vertex(
+  uint unit_vertex_id [[vertex_id]],
+  uint rect_id [[instance_id]],
+  constant float2 *unit_vertices [[buffer(LensRectInputIndex_Vertices)]],
+  constant LensRect *rects [[buffer(LensRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(LensRectInputIndex_ViewportSize)]],
+  constant LensShape *shapes [[buffer(LensRectInputIndex_Shapes)]]
+) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  LensRect rect = rects[rect_id];
+  LensRectVarying out;
+  out.position = to_device_position(unit_vertex, rect.bounds, viewport_size);
+  out.rect_id = rect_id;
+  out.light_dir = float2(cos(rect.light_angle_radians), sin(rect.light_angle_radians));
+  // Use the first shape's corner radii as the edge-band reference. Shapes
+  // in a union typically share a radius; if they don't, the visible
+  // difference in the Fresnel band width is minor compared to the other
+  // shader outputs.
+  LensShape shape0 = shapes[rect.shape_offset];
+  float corner_avg = 0.25 * (
+    shape0.corner_radii.top_left
+    + shape0.corner_radii.top_right
+    + shape0.corner_radii.bottom_right
+    + shape0.corner_radii.bottom_left
+  );
+  float splay_px = max(rect.splay, 1.0);
+  out.edge_band = max(corner_avg * 0.5, splay_px);
+  float4 clip = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask.bounds);
+  out.clip_distance[0] = clip.x;
+  out.clip_distance[1] = clip.y;
+  out.clip_distance[2] = clip.z;
+  out.clip_distance[3] = clip.w;
+  return out;
+}
+
+fragment float4 lens_rect_fragment(
+  LensRectFragmentInput input [[stage_in]],
+  constant LensRect *rects [[buffer(LensRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(LensRectInputIndex_ViewportSize)]],
+  texture2d<float> blur_pyramid [[texture(LensRectInputIndex_BlurPyramid)]],
+  sampler blur_sampler [[sampler(LensRectInputIndex_BlurSampler)]],
+  constant LensShape *shapes [[buffer(LensRectInputIndex_Shapes)]],
+  constant SceneBlurParams *scene_blur [[buffer(LensRectInputIndex_SceneBlurParams)]]
+) {
+  LensRect rect = rects[input.rect_id];
+  float2 viewport_f = float2((float)viewport_size->width, (float)viewport_size->height);
+
+  float2 frag_pos = input.position.xy;
+  uint shape_count = rect.shape_count;
+  if (shape_count == 0u) {
+    return float4(0.0, 0.0, 0.0, 0.0);
+  }
+  float blend_k = max(rect.edge_blend_distance, 0.0);
+  bool blend_shapes = blend_k > 0.0 && shape_count > 1u;
+
+  // Pass 1: accumulate per-shape SDFs plus a soft per-shape mask
+  // attenuation (0 outside the shape's own `content_mask`, 1 inside,
+  // with a ~1-pixel feather).
+  const float antialias_threshold = 0.5;
+  // Mirror of `MAX_LENS_SHAPES` in shaders.wgsl / MAX_LENS_SHAPES_PER_GROUP
+  // in window.rs; bumping either requires bumping the others in lockstep.
+  constexpr uint MAX_LENS_SHAPES = 8u;
+  Corners_ScaledPixels zero_corners = {0.0, 0.0, 0.0, 0.0};
+  float per_shape_sdf[MAX_LENS_SHAPES];
+  float per_shape_mask_attn[MAX_LENS_SHAPES];
+  float2 per_shape_dir[MAX_LENS_SHAPES];
+  float per_shape_norm_dist[MAX_LENS_SHAPES];
+  float min_sdf = 1e20;
+  for (uint i = 0u; i < shape_count; ++i) {
+    LensShape s = shapes[rect.shape_offset + i];
+    float d = quad_sdf(frag_pos, s.bounds, s.corner_radii);
+    per_shape_sdf[i] = d;
+    min_sdf = min(min_sdf, d);
+
+    float mask_sdf = quad_sdf(frag_pos, s.content_mask, zero_corners);
+    per_shape_mask_attn[i] = saturate(antialias_threshold - mask_sdf);
+
+    float2 origin = float2(s.bounds.origin.x, s.bounds.origin.y);
+    float2 size = float2(s.bounds.size.width, s.bounds.size.height);
+    float2 center = origin + size * 0.5;
+    float2 half_size = size * 0.5;
+    float2 local_pos = frag_pos - center;
+    float local_len = length(local_pos);
+    per_shape_dir[i] = local_len > 0.001 ? local_pos / max(local_len, 0.0001) : float2(0.0, 0.0);
+    float2 safe_half = max(half_size, float2(1.0, 1.0));
+    per_shape_norm_dist[i] = clamp(length(local_pos / safe_half), 0.0, 1.0);
+  }
+
+  float union_sdf;
+  float weights[MAX_LENS_SHAPES];
+  // Scales the final fragment alpha to fade at per-shape mask boundaries.
+  // 1 when every shape is fully inside its own mask (or no mask in play);
+  // smoothly decreases as shapes' mask edges cross the fragment.
+  float coverage_factor;
+  if (blend_shapes) {
+    // Exponential smooth-minimum. Each shape contributes a weight
+    // `mask_attn[i] * exp(-(d_i - min_d) / k)` — masked-out shapes are
+    // pulled toward zero weight, so their neighbors dominate the
+    // refraction / Fresnel blend naturally.
+    float min_d = min_sdf;
+    float total_pre = 0.0;
+    float total_masked = 0.0;
+    for (uint i = 0u; i < shape_count; ++i) {
+      float pre = exp(-(per_shape_sdf[i] - min_d) / blend_k);
+      float masked = per_shape_mask_attn[i] * pre;
+      weights[i] = masked;
+      total_pre += pre;
+      total_masked += masked;
+    }
+    if (total_masked < 1e-6) {
+      return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    // Softmin value: -k * log(Σ exp(-d_i / k)), shifted by min_d to avoid
+    // overflow. Unmasked sum preserves the geometric union outline even
+    // when one shape is masked out — we only attenuate the alpha and
+    // refraction weights, not the shape boundary itself.
+    union_sdf = min_d - blend_k * log(max(total_pre, 1e-6));
+    float inv_masked = 1.0 / max(total_masked, 1e-6);
+    // Clamp to [0, 1]: when `total_masked` approaches the 1e-6 floor,
+    // individual weights can scale past 1.0 and blow up the refraction
+    // accumulator. Matches the WGSL side.
+    for (uint i = 0u; i < shape_count; ++i) {
+      weights[i] = clamp(weights[i] * inv_masked, 0.0, 1.0);
+    }
+    coverage_factor = clamp(total_masked / max(total_pre, 1e-6), 0.0, 1.0);
+  } else {
+    // Single shape or hard union: pick the min-SDF shape deterministically.
+    uint winner = 0u;
+    float min_d = per_shape_sdf[0];
+    for (uint i = 1u; i < shape_count; ++i) {
+      if (per_shape_sdf[i] < min_d) {
+        min_d = per_shape_sdf[i];
+        winner = i;
+      }
+    }
+    union_sdf = min_d;
+    for (uint i = 0u; i < shape_count; ++i) {
+      weights[i] = (i == winner) ? 1.0 : 0.0;
+    }
+    coverage_factor = per_shape_mask_attn[winner];
+    if (coverage_factor < 1e-3) {
+      return float4(0.0, 0.0, 0.0, 0.0);
+    }
+  }
+
+  float aa = saturate(antialias_threshold - union_sdf) * coverage_factor;
+  if (aa <= 0.0) {
+    return float4(0.0, 0.0, 0.0, 0.0);
+  }
+
+  // Pass 2: weighted refraction offset. The per-shape parabolic distortion
+  // (`(1 - r^2) * direction * refraction / 2`) is softmin-weighted so fields
+  // from merging shapes blend instead of clipping.
+  float depth_scale = clamp(rect.depth * 0.01, 0.0, 1.0);
+  float2 offset_px = float2(0.0, 0.0);
+  float weighted_norm_dist = 0.0;
+  // `weighted_dir` is a weighted *sum* of unit directions, not a unit
+  // vector. Between shapes with opposing centers it shrinks toward zero,
+  // which fades chromatic dispersion in inter-shape seams. Do not
+  // renormalize — matches WGSL.
+  float2 weighted_dir = float2(0.0, 0.0);
+  for (uint i = 0u; i < shape_count; ++i) {
+    float nd = per_shape_norm_dist[i];
+    float distortion = (1.0 - nd * nd) * (1.0 + depth_scale);
+    offset_px += weights[i] * (distortion * per_shape_dir[i] * rect.refraction * 0.5);
+    weighted_norm_dist += weights[i] * nd;
+    weighted_dir += weights[i] * per_shape_dir[i];
+  }
+  float2 base_uv = frag_pos / viewport_f;
+  // Clamp to [0,1]: strong `refraction` on lens rims can push UVs past
+  // the edge. The pyramid sampler is ClampToEdge, but clamp here too so
+  // a future sampler-state change can't silently wrap across the frame.
+  float2 refracted_uv = clamp(
+      base_uv - offset_px / viewport_f,
+      float2(0.0, 0.0),
+      float2(1.0, 1.0)
+  );
+  float target_radius = gradient_target_radius(
+    frag_pos,
+    rect.bounds,
+    rect.blur_radius,
+    rect.blur_radius_end,
+    float2(rect.gradient_direction[0], rect.gradient_direction[1])
+  );
+
+  float4 color;
+  if (rect.dispersion > 0.0) {
+    float ca_shift = weighted_norm_dist * rect.dispersion;
+    float2 ca_dir = weighted_dir / viewport_f;
+    float2 uv_r = refracted_uv - ca_dir * ca_shift;
+    float2 uv_b = refracted_uv + ca_dir * ca_shift;
+    color.r = sample_blur_pyramid(blur_pyramid, blur_sampler, uv_r, target_radius, scene_blur).r;
+    color.g = sample_blur_pyramid(blur_pyramid, blur_sampler, refracted_uv, target_radius, scene_blur).g;
+    color.b = sample_blur_pyramid(blur_pyramid, blur_sampler, uv_b, target_radius, scene_blur).b;
+  } else {
+    color = sample_blur_pyramid(blur_pyramid, blur_sampler, refracted_uv, target_radius, scene_blur);
+  }
+  color.a = 1.0;
+
+  float4 tint_rgba = hsla_to_rgba(rect.tint);
+  color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
+
+  if (rect.light_intensity > 0.0) {
+    float edge_dist = fabs(union_sdf);
+    float edge_falloff = smoothstep(input.edge_band, 0.0, edge_dist);
+    float weighted_len = length(weighted_dir);
+    float facing = weighted_len > 0.001
+      ? clamp(dot(weighted_dir / weighted_len, input.light_dir), 0.0, 1.0)
+      : 1.0;
+    float edge_glow = edge_falloff * facing * rect.light_intensity;
+    color = color + float4(edge_glow, edge_glow, edge_glow, 0.0);
+  }
+
+  return float4(color.rgb, color.a * aa);
+}
+
+// --- MirrorRect: sampled+flipped framebuffer region ---
+//
+// Samples `source_bounds` from either the un-blurred or Kawase-blurred
+// snapshot (gradient blur supported the same way `BlurRect` / `LensRect`
+// do), applies the horizontal/vertical flips encoded in `mirror_axis`,
+// composites into `bounds` with a rounded-rect SDF clip and tint.
+
+struct MirrorRectVarying {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct MirrorRectFragmentInput {
+  uint rect_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex MirrorRectVarying mirror_rect_vertex(
+  uint unit_vertex_id [[vertex_id]],
+  uint rect_id [[instance_id]],
+  constant float2 *unit_vertices [[buffer(MirrorRectInputIndex_Vertices)]],
+  constant MirrorRect *rects [[buffer(MirrorRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(MirrorRectInputIndex_ViewportSize)]]
+) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  MirrorRect rect = rects[rect_id];
+  MirrorRectVarying out;
+  out.position = to_device_position(unit_vertex, rect.bounds, viewport_size);
+  out.rect_id = rect_id;
+  float4 clip = distance_from_clip_rect(unit_vertex, rect.bounds, rect.content_mask.bounds);
+  out.clip_distance[0] = clip.x;
+  out.clip_distance[1] = clip.y;
+  out.clip_distance[2] = clip.z;
+  out.clip_distance[3] = clip.w;
+  return out;
+}
+
+fragment float4 mirror_rect_fragment(
+  MirrorRectFragmentInput input [[stage_in]],
+  constant MirrorRect *rects [[buffer(MirrorRectInputIndex_Rects)]],
+  constant Size_DevicePixels *viewport_size [[buffer(MirrorRectInputIndex_ViewportSize)]],
+  texture2d<float> blur_pyramid [[texture(MirrorRectInputIndex_BlurPyramid)]],
+  sampler blur_sampler [[sampler(MirrorRectInputIndex_BlurSampler)]],
+  constant SceneBlurParams *scene_blur [[buffer(MirrorRectInputIndex_SceneBlurParams)]]
+) {
+  MirrorRect rect = rects[input.rect_id];
+  float2 viewport_f = float2((float)viewport_size->width, (float)viewport_size->height);
+
+  // Normalized position within the destination rect.
+  float2 dest_origin = float2(rect.bounds.origin.x, rect.bounds.origin.y);
+  float2 dest_size = max(float2(rect.bounds.size.width, rect.bounds.size.height), float2(1.0));
+  float2 u = clamp((input.position.xy - dest_origin) / dest_size, float2(0.0), float2(1.0));
+
+  // Flip per axis. MIRROR_AXIS_HORIZONTAL = bit 0, VERTICAL = bit 1.
+  if ((rect.mirror_axis & 1u) != 0u) {
+    u.x = 1.0 - u.x;
+  }
+  if ((rect.mirror_axis & 2u) != 0u) {
+    u.y = 1.0 - u.y;
+  }
+
+  // Map back to source rect, then to viewport UV.
+  float2 src_origin = float2(rect.source_bounds.origin.x, rect.source_bounds.origin.y);
+  float2 src_size = float2(rect.source_bounds.size.width, rect.source_bounds.size.height);
+  float2 src_pos = src_origin + u * src_size;
+  float2 src_uv = src_pos / viewport_f;
+  // Reject out-of-viewport samples to transparent.
+  if (src_uv.x < 0.0 || src_uv.x > 1.0 || src_uv.y < 0.0 || src_uv.y > 1.0) {
+    return float4(0.0, 0.0, 0.0, 0.0);
+  }
+
+  float target_radius = gradient_target_radius(
+    input.position.xy,
+    rect.bounds,
+    rect.blur_radius,
+    rect.blur_radius_end,
+    float2(rect.gradient_direction[0], rect.gradient_direction[1])
+  );
+  float4 color = sample_blur_pyramid(blur_pyramid, blur_sampler, src_uv, target_radius, scene_blur);
+
+  float4 tint_rgba = hsla_to_rgba(rect.tint);
+  color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
+
+  float alpha = color.a;
+  if (rect.clip_to_destination != 0u) {
+    float sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+    const float antialias_threshold = 0.5;
+    float aa = saturate(antialias_threshold - sdf);
+    alpha = color.a * aa;
+  }
+  return float4(color.rgb, alpha);
 }
