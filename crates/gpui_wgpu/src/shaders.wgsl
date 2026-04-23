@@ -1357,8 +1357,11 @@ struct BlurRect {
     content_mask: Bounds,
     corner_radii: Corners,
     blur_radius: f32,
-    pad: f32,
+    blur_radius_end: f32,
+    gradient_direction: vec2<f32>,
     tint: Hsla,
+    // Aligns the struct stride to 96 bytes (matching the Rust side).
+    _pad_end: vec2<f32>,
 }
 
 struct LensRect {
@@ -1369,19 +1372,25 @@ struct LensRect {
     shape_offset: u32,
     shape_count: u32,
     edge_blend_distance: f32,
-    _pad_a: f32,
     blur_radius: f32,
+    gradient_direction: vec2<f32>,
+    blur_radius_end: f32,
     refraction: f32,
     depth: f32,
     dispersion: f32,
     splay: f32,
     light_angle_radians: f32,
-    pad_light: f32,
     light_intensity: f32,
-    pad: f32,
     tint: Hsla,
     // Aligns the struct stride to 112 bytes (matching the Rust side).
     pad2: f32,
+}
+
+struct SceneBlurParams {
+    max_blur_radius: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct LensShape {
@@ -1400,6 +1409,8 @@ struct LensShape {
 @group(1) @binding(2) var t_blur_input: texture_2d<f32>;
 @group(1) @binding(3) var s_blur_input: sampler;
 @group(1) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
+@group(1) @binding(5) var t_unblurred_input: texture_2d<f32>;
+@group(1) @binding(6) var<uniform> scene_blur: SceneBlurParams;
 
 // --- BlurRect: rounded rect that samples the blurred framebuffer ---
 
@@ -1423,6 +1434,30 @@ fn vs_blur_rect(
     return out;
 }
 
+// Compute per-pixel blur-strength mix factor for linear-gradient blur. See
+// the Metal implementation for notes on the mix-approximation caveat.
+fn gradient_blur_strength(
+    frag_pos: vec2<f32>,
+    bounds: Bounds,
+    radius_start: f32,
+    radius_end: f32,
+    gradient_direction: vec2<f32>,
+    scene_max_radius: f32,
+) -> f32 {
+    if (scene_max_radius <= 0.0) {
+        return 0.0;
+    }
+    let dir_len2 = dot(gradient_direction, gradient_direction);
+    if (dir_len2 < 1e-6) {
+        return clamp(radius_start / scene_max_radius, 0.0, 1.0);
+    }
+    let local = frag_pos - bounds.origin;
+    let extent = max(dot(bounds.size, gradient_direction), 1.0);
+    let t = clamp(dot(local, gradient_direction) / extent, 0.0, 1.0);
+    let target_radius = mix(radius_start, radius_end, t);
+    return clamp(target_radius / scene_max_radius, 0.0, 1.0);
+}
+
 @fragment
 fn fs_blur_rect(input: BlurRectVarying) -> @location(0) vec4<f32> {
     if (any(input.clip_distances < vec4<f32>(0.0))) {
@@ -1430,7 +1465,17 @@ fn fs_blur_rect(input: BlurRectVarying) -> @location(0) vec4<f32> {
     }
     let rect = b_blur_rects[input.rect_id];
     let fb_uv = input.position.xy / globals.viewport_size;
-    var color = textureSample(t_blur_input, s_blur_input, fb_uv);
+    let blurred = textureSample(t_blur_input, s_blur_input, fb_uv);
+    let sharp = textureSample(t_unblurred_input, s_blur_input, fb_uv);
+    let strength = gradient_blur_strength(
+        input.position.xy,
+        rect.bounds,
+        rect.blur_radius,
+        rect.blur_radius_end,
+        rect.gradient_direction,
+        scene_blur.max_blur_radius,
+    );
+    var color = mix(sharp, blurred, strength);
     let tint_rgba = hsla_to_rgba(rect.tint);
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
@@ -1568,16 +1613,40 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     }
     let base_uv = input.position.xy / globals.viewport_size;
     let refracted_uv = base_uv - offset_px / globals.viewport_size;
+    let strength = gradient_blur_strength(
+        input.position.xy,
+        rect.bounds,
+        rect.blur_radius,
+        rect.blur_radius_end,
+        rect.gradient_direction,
+        scene_blur.max_blur_radius,
+    );
 
     var color: vec4<f32>;
     if (rect.dispersion > 0.0) {
         let ca_shift = weighted_norm_dist * rect.dispersion;
         let ca_dir = weighted_dir / globals.viewport_size;
-        color.r = textureSample(t_blur_input, s_blur_input, refracted_uv - ca_dir * ca_shift).r;
-        color.g = textureSample(t_blur_input, s_blur_input, refracted_uv).g;
-        color.b = textureSample(t_blur_input, s_blur_input, refracted_uv + ca_dir * ca_shift).b;
+        let uv_r = refracted_uv - ca_dir * ca_shift;
+        let uv_b = refracted_uv + ca_dir * ca_shift;
+        color.r = mix(
+            textureSample(t_unblurred_input, s_blur_input, uv_r).r,
+            textureSample(t_blur_input, s_blur_input, uv_r).r,
+            strength,
+        );
+        color.g = mix(
+            textureSample(t_unblurred_input, s_blur_input, refracted_uv).g,
+            textureSample(t_blur_input, s_blur_input, refracted_uv).g,
+            strength,
+        );
+        color.b = mix(
+            textureSample(t_unblurred_input, s_blur_input, uv_b).b,
+            textureSample(t_blur_input, s_blur_input, uv_b).b,
+            strength,
+        );
     } else {
-        color = textureSample(t_blur_input, s_blur_input, refracted_uv);
+        let blurred = textureSample(t_blur_input, s_blur_input, refracted_uv);
+        let sharp = textureSample(t_unblurred_input, s_blur_input, refracted_uv);
+        color = mix(sharp, blurred, strength);
     }
     color.a = 1.0;
 

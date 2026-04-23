@@ -3413,8 +3413,10 @@ impl Window {
             content_mask: content_mask.scale(scale_factor),
             corner_radii: corner_radii.scale(scale_factor),
             blur_radius: effect.radius.scale(scale_factor),
-            pad: 0.0,
+            blur_radius_end: effect.radius_end.scale(scale_factor),
+            gradient_direction: effect.gradient_direction,
             tint: effect.tint.opacity(opacity),
+            _pad_end: [0.0; 2],
         });
     }
 
@@ -3523,16 +3525,15 @@ impl Window {
                 shape_offset: 0,
                 shape_count: 0,
                 edge_blend_distance: blend.scale(scale_factor),
-                _pad_a: 0.0,
                 blur_radius: effect.radius.scale(scale_factor),
+                gradient_direction: effect.gradient_direction,
+                blur_radius_end: effect.radius_end.scale(scale_factor),
                 refraction: effect.refraction * 100.0,
                 depth: effect.depth * 100.0,
                 dispersion: effect.dispersion * 100.0,
                 splay: effect.splay.scale(scale_factor),
                 light_angle_radians: effect.light_angle.0,
-                pad_light: 0.0,
                 light_intensity: effect.light_intensity,
-                pad: 0.0,
                 tint: effect.tint.opacity(opacity),
                 pad2: 0.0,
             },
@@ -6050,12 +6051,49 @@ pub fn outline(
     }
 }
 
+/// Direction along which a linear-gradient blur fades. Horizontal (leading →
+/// trailing) or Vertical (top → bottom). Used by the `_gradient` builders on
+/// [`BlurEffect`] / [`LensEffect`] when the consumer wants a simple
+/// axis-aligned fade (HIG scroll-edge blur). For diagonal fades, use
+/// [`BlurEffect::with_gradient_direction`] directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlurAxis {
+    /// Left-to-right (+x) fade.
+    Horizontal,
+    /// Top-to-bottom (+y) fade.
+    Vertical,
+}
+
+impl BlurAxis {
+    fn direction(self) -> [f32; 2] {
+        match self {
+            BlurAxis::Horizontal => [1.0, 0.0],
+            BlurAxis::Vertical => [0.0, 1.0],
+        }
+    }
+}
+
 /// A dual-Kawase backdrop blur with tint, applied to a rounded rectangle.
 /// Passed to [`Window::paint_blur_rect`].
+///
+/// Supports either a uniform blur (`radius_end == radius`, no gradient) or a
+/// linear-gradient blur along `gradient_direction` where the per-pixel
+/// strength interpolates from `radius` at the leading edge of the rect to
+/// `radius_end` at the trailing edge. The gradient variant is a
+/// `mix(unblurred, max-blurred, t)` approximation — visually plausible for
+/// HIG scroll-edge fades but not a true Gaussian per-pixel blur.
 #[derive(Clone, Copy, Debug)]
 pub struct BlurEffect {
-    /// Gaussian-equivalent blur radius, in window pixels.
+    /// Gaussian-equivalent blur radius at the start of the gradient (or the
+    /// uniform radius if `gradient_direction` is zero), in window pixels.
     pub radius: Pixels,
+    /// Blur radius at the end of the gradient. Equal to `radius` for a
+    /// uniform blur; differs to fade the blur strength along
+    /// `gradient_direction`.
+    pub radius_end: Pixels,
+    /// Normalized 2D axis the gradient runs along. `[0.0, 0.0]` disables the
+    /// gradient (uniform `radius`).
+    pub gradient_direction: [f32; 2],
     /// Number of Kawase downsample/upsample passes. Higher = wider blur,
     /// lower = sharper. Clamped to 1..=5 by the renderer. Typical: 3.
     ///
@@ -6072,6 +6110,8 @@ impl Default for BlurEffect {
     fn default() -> Self {
         Self {
             radius: px(20.0),
+            radius_end: px(20.0),
+            gradient_direction: [0.0, 0.0],
             kernel_levels: 3,
             tint: transparent_black(),
         }
@@ -6079,13 +6119,32 @@ impl Default for BlurEffect {
 }
 
 impl BlurEffect {
-    /// Construct a blur with HIG defaults (3 Kawase levels, no tint) at the
-    /// given radius.
+    /// Construct a uniform blur with HIG defaults (3 Kawase levels, no tint)
+    /// at the given radius.
     pub fn new(radius: Pixels) -> Self {
         Self {
             radius,
+            radius_end: radius,
             ..Default::default()
         }
+    }
+
+    /// Construct a linear-gradient blur that fades from `from` to `to` along
+    /// the given [`BlurAxis`].
+    pub fn linear_gradient(from: Pixels, to: Pixels, axis: BlurAxis) -> Self {
+        Self {
+            radius: from,
+            radius_end: to,
+            gradient_direction: axis.direction(),
+            ..Default::default()
+        }
+    }
+
+    /// Override the gradient direction with an arbitrary 2D vector. The
+    /// shader normalizes the input; callers should pass a non-zero vector.
+    pub fn with_gradient_direction(mut self, direction: [f32; 2]) -> Self {
+        self.gradient_direction = direction;
+        self
     }
 }
 
@@ -6097,8 +6156,14 @@ impl BlurEffect {
 /// light angle -45°, light intensity 0.67.
 #[derive(Clone, Copy, Debug)]
 pub struct LensEffect {
-    /// Backdrop-blur radius, in window pixels.
+    /// Backdrop-blur radius (start of the gradient, or the uniform radius),
+    /// in window pixels.
     pub radius: Pixels,
+    /// Backdrop-blur radius at the end of the gradient, in window pixels.
+    /// Equal to `radius` for uniform blur.
+    pub radius_end: Pixels,
+    /// Normalized gradient direction. `[0.0, 0.0]` means uniform blur.
+    pub gradient_direction: [f32; 2],
     /// Number of Kawase downsample/upsample passes. Higher = wider blur,
     /// lower = sharper. Clamped to 1..=5 by the renderer. Typical: 3.
     ///
@@ -6131,6 +6196,8 @@ impl Default for LensEffect {
     fn default() -> Self {
         Self {
             radius: px(20.0),
+            radius_end: px(20.0),
+            gradient_direction: [0.0, 0.0],
             kernel_levels: 3,
             refraction: 1.0,
             depth: 0.16,
@@ -6144,14 +6211,33 @@ impl Default for LensEffect {
 }
 
 impl LensEffect {
-    /// Construct a lens with HIG defaults (3 Kawase levels, full refraction,
-    /// no dispersion, -45° light at 0.67 intensity, no tint) at the given
-    /// blur radius.
+    /// Construct a uniform lens with HIG defaults (3 Kawase levels, full
+    /// refraction, no dispersion, -45° light at 0.67 intensity, no tint) at
+    /// the given blur radius.
     pub fn new(radius: Pixels) -> Self {
         Self {
             radius,
+            radius_end: radius,
             ..Default::default()
         }
+    }
+
+    /// Construct a linear-gradient lens that fades the blur strength from
+    /// `from` to `to` along the given [`BlurAxis`]. Other lens parameters
+    /// keep their HIG defaults.
+    pub fn linear_gradient(from: Pixels, to: Pixels, axis: BlurAxis) -> Self {
+        Self {
+            radius: from,
+            radius_end: to,
+            gradient_direction: axis.direction(),
+            ..Default::default()
+        }
+    }
+
+    /// Override the gradient direction with an arbitrary 2D vector.
+    pub fn with_gradient_direction(mut self, direction: [f32; 2]) -> Self {
+        self.gradient_direction = direction;
+        self
     }
 }
 

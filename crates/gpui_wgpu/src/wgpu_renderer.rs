@@ -61,6 +61,16 @@ struct BlurParams {
     pad: f32,
 }
 
+/// Scene-wide blur parameters used by the gradient-blur shaders to
+/// normalize per-pixel strength into a [0, 1] mix factor. Written once per
+/// frame and bound to both `blur_rect` and `lens_rect` pipelines.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SceneBlurParams {
+    max_blur_radius: f32,
+    _pad: [f32; 3],
+}
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 struct PathSprite {
@@ -140,6 +150,11 @@ struct WgpuResources {
     /// frame (1..=5).
     blur_chain_textures: [Option<wgpu::Texture>; BLUR_CHAIN_LEVELS],
     blur_chain_views: [Option<wgpu::TextureView>; BLUR_CHAIN_LEVELS],
+    /// Un-blurred copy of the framebuffer, preserved across the Kawase
+    /// chain so variable-radius blur / lens primitives can mix between
+    /// the blurred and un-blurred sources per pixel.
+    framebuffer_snapshot_texture: Option<wgpu::Texture>,
+    framebuffer_snapshot_view: Option<wgpu::TextureView>,
     /// Bind groups pre-built for downsample/upsample passes. Downsample
     /// pass `i` samples level `i` and writes level `i + 1`; upsample pass
     /// `i` samples level `i + 1` and writes level `i`.
@@ -155,6 +170,8 @@ struct WgpuResources {
     /// equal to `size_of::<BlurParams>()` rounded up to
     /// `min_uniform_buffer_offset_alignment`.
     blur_params_slot_stride: u64,
+    /// Scene-wide gradient-blur params; written once per frame.
+    scene_blur_params_buffer: wgpu::Buffer,
 }
 
 impl WgpuResources {
@@ -169,6 +186,8 @@ impl WgpuResources {
         for slot in &mut self.blur_chain_views {
             *slot = None;
         }
+        self.framebuffer_snapshot_texture = None;
+        self.framebuffer_snapshot_view = None;
         for slot in &mut self.blur_down_bind_groups {
             *slot = None;
         }
@@ -467,6 +486,13 @@ impl WgpuRenderer {
             mapped_at_creation: false,
         });
 
+        let scene_blur_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene_blur_params_buffer"),
+            size: std::mem::size_of::<SceneBlurParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals_buffer"),
             size: gamma_offset + gamma_size,
@@ -558,11 +584,14 @@ impl WgpuRenderer {
             path_msaa_view: None,
             blur_chain_textures: Default::default(),
             blur_chain_views: Default::default(),
+            framebuffer_snapshot_texture: None,
+            framebuffer_snapshot_view: None,
             blur_down_bind_groups: Default::default(),
             blur_up_bind_groups: Default::default(),
             blur_sampler,
             blur_params_buffer,
             blur_params_slot_stride,
+            scene_blur_params_buffer,
         };
 
         Ok(Self {
@@ -741,6 +770,26 @@ impl WgpuRenderer {
             ],
         });
 
+        let unblurred_texture_entry = wgpu::BindGroupLayoutEntry {
+            binding: 5,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let scene_blur_params_entry = wgpu::BindGroupLayoutEntry {
+            binding: 6,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let blur_rect = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blur_rect_layout"),
             entries: &[
@@ -761,6 +810,8 @@ impl WgpuRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                unblurred_texture_entry,
+                scene_blur_params_entry,
             ],
         });
 
@@ -785,6 +836,8 @@ impl WgpuRenderer {
                     count: None,
                 },
                 storage_buffer_entry(4),
+                unblurred_texture_entry,
+                scene_blur_params_entry,
             ],
         });
 
@@ -1342,6 +1395,27 @@ impl WgpuRenderer {
             resources.blur_chain_views[level] = Some(view);
         }
 
+        // Un-blurred framebuffer snapshot, surface-sized. Shares the chain's
+        // color format so sampling between it and `blur_chain_textures[0]`
+        // produces consistent results.
+        let snapshot_texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("framebuffer_snapshot"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: chain_format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let snapshot_view = snapshot_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        resources.framebuffer_snapshot_texture = Some(snapshot_texture);
+        resources.framebuffer_snapshot_view = Some(snapshot_view);
+
         // Pre-build every bind group for the passes the chain can host.
         // Each pass reads one level and writes the adjacent level; the
         // bind-group inputs (source view + sampler + params buffer) are
@@ -1569,6 +1643,18 @@ impl WgpuRenderer {
         let blur_kernel_levels = scene.max_blur_kernel_levels();
         let blur_radius = scene.max_blur_radius().0;
         let blur_offset_multiplier = (blur_radius / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
+        {
+            let params = SceneBlurParams {
+                max_blur_radius: blur_radius,
+                _pad: [0.0; 3],
+            };
+            let resources = self.resources();
+            resources.queue.write_buffer(
+                &resources.scene_blur_params_buffer,
+                0,
+                bytemuck::bytes_of(&params),
+            );
+        }
 
         loop {
             let mut instance_offset: u64 = 0;
@@ -2084,6 +2170,11 @@ impl WgpuRenderer {
             .queue
             .write_buffer(&resources.blur_params_buffer, 0, &slot_bytes);
 
+        let copy_extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: frame_texture,
@@ -2099,12 +2190,25 @@ impl WgpuRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
+            copy_extent,
         );
+        if let Some(snapshot) = resources.framebuffer_snapshot_texture.as_ref() {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: frame_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: snapshot,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                copy_extent,
+            );
+        }
 
         for i in 0..kernel_levels {
             let dst_view = resources.blur_chain_views[i + 1]
@@ -2181,6 +2285,9 @@ impl WgpuRenderer {
         let Some(snapshot_view) = resources.blur_chain_views[0].as_ref() else {
             return true;
         };
+        let Some(unblurred_view) = resources.framebuffer_snapshot_view.as_ref() else {
+            return true;
+        };
         let bind_group = resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2198,6 +2305,14 @@ impl WgpuRenderer {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(unblurred_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
                     },
                 ],
             });
@@ -2237,6 +2352,9 @@ impl WgpuRenderer {
         let Some(snapshot_view) = resources.blur_chain_views[0].as_ref() else {
             return true;
         };
+        let Some(unblurred_view) = resources.framebuffer_snapshot_view.as_ref() else {
+            return true;
+        };
         let bind_group = resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2258,6 +2376,14 @@ impl WgpuRenderer {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: self.instance_binding(shapes_offset, shapes_size),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(unblurred_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
                     },
                 ],
             });

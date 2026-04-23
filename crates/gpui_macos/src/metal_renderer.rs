@@ -148,6 +148,11 @@ pub(crate) struct MetalRenderer {
     /// half-sized. `BlurEffect::kernel_levels` selects the depth used per
     /// frame (1..=5).
     blur_chain_textures: [Option<metal::Texture>; BLUR_CHAIN_LEVELS],
+    /// Un-blurred copy of the framebuffer, preserved across the Kawase
+    /// chain so variable-radius blur / lens primitives can mix between
+    /// the blurred and un-blurred sources per pixel. Allocated alongside
+    /// `blur_chain_textures[0]`.
+    framebuffer_snapshot_texture: Option<metal::Texture>,
 }
 
 /// Maximum blur chain depth (`kernel_levels` is clamped to this).
@@ -450,6 +455,7 @@ impl MetalRenderer {
             lens_rect_pipeline_state,
             blur_sampler,
             blur_chain_textures: Default::default(),
+            framebuffer_snapshot_texture: None,
         }
     }
 
@@ -548,10 +554,23 @@ impl MetalRenderer {
                 );
                 self.blur_chain_textures[level] = Some(self.device.new_texture(&descriptor));
             }
+
+            let width = (size.width.0 as u64).max(1);
+            let height = (size.height.0 as u64).max(1);
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(width);
+            descriptor.set_height(height);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            self.framebuffer_snapshot_texture = Some(self.device.new_texture(&descriptor));
         } else {
             for slot in &mut self.blur_chain_textures {
                 *slot = None;
             }
+            self.framebuffer_snapshot_texture = None;
         }
     }
 
@@ -881,8 +900,13 @@ impl MetalRenderer {
         let mut instance_offset = 0;
 
         let blur_kernel_levels = scene.max_blur_kernel_levels();
+        let scene_max_blur_radius = scene.max_blur_radius().0;
         let blur_offset_multiplier =
-            (scene.max_blur_radius().0 / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
+            (scene_max_blur_radius / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
+        let scene_blur_params = SceneBlurParams {
+            max_blur_radius: scene_max_blur_radius,
+            _pad: [0.0; 3],
+        };
         // Tracks whether the Kawase chain already reflects the drawable
         // contents since the last non-blur batch. Reset to `false` at
         // frame start and whenever any other primitive writes to the
@@ -1017,6 +1041,7 @@ impl MetalRenderer {
                         if did_snapshot {
                             self.draw_blur_rects(
                                 rects,
+                                scene_blur_params,
                                 instance_buffer,
                                 &mut instance_offset,
                                 viewport_size,
@@ -1060,6 +1085,7 @@ impl MetalRenderer {
                             self.draw_lens_rects(
                                 rects,
                                 &scene.lens_shapes,
+                                scene_blur_params,
                                 instance_buffer,
                                 &mut instance_offset,
                                 viewport_size,
@@ -1427,18 +1453,33 @@ impl MetalRenderer {
         let snapshot = self.blur_chain_textures[0]
             .as_ref()
             .expect("chain level 0 checked above");
+        let Some(ref framebuffer_snapshot) = self.framebuffer_snapshot_texture else {
+            return false;
+        };
 
         let blit = command_buffer.new_blit_command_encoder();
+        let full_size = metal::MTLSize {
+            width: texture.width(),
+            height: texture.height(),
+            depth: 1,
+        };
         blit.copy_from_texture(
             texture,
             0,
             0,
             metal::MTLOrigin { x: 0, y: 0, z: 0 },
-            metal::MTLSize {
-                width: texture.width(),
-                height: texture.height(),
-                depth: 1,
-            },
+            full_size,
+            framebuffer_snapshot,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.copy_from_texture(
+            texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            full_size,
             snapshot,
             0,
             0,
@@ -1527,6 +1568,7 @@ impl MetalRenderer {
     fn draw_blur_rects(
         &self,
         rects: &[BlurRect],
+        scene_blur_params: SceneBlurParams,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1536,6 +1578,9 @@ impl MetalRenderer {
             return true;
         }
         let Some(ref snapshot) = self.blur_chain_textures[0] else {
+            return false;
+        };
+        let Some(ref unblurred) = self.framebuffer_snapshot_texture else {
             return false;
         };
         align_offset(instance_offset);
@@ -1566,8 +1611,15 @@ impl MetalRenderer {
             mem::size_of_val(&viewport_size) as u64,
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
+        command_encoder.set_fragment_bytes(
+            BlurRectInputIndex::SceneBlurParams as u64,
+            mem::size_of::<SceneBlurParams>() as u64,
+            &scene_blur_params as *const SceneBlurParams as *const _,
+        );
         command_encoder
             .set_fragment_texture(BlurRectInputIndex::BlurTexture as u64, Some(snapshot));
+        command_encoder
+            .set_fragment_texture(BlurRectInputIndex::UnblurredTexture as u64, Some(unblurred));
         command_encoder.set_fragment_sampler_state(
             BlurRectInputIndex::BlurSampler as u64,
             Some(&self.blur_sampler),
@@ -1598,6 +1650,7 @@ impl MetalRenderer {
         &self,
         rects: &[LensRect],
         shapes: &[LensShape],
+        scene_blur_params: SceneBlurParams,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1612,6 +1665,9 @@ impl MetalRenderer {
             return false;
         }
         let Some(ref snapshot) = self.blur_chain_textures[0] else {
+            return false;
+        };
+        let Some(ref unblurred) = self.framebuffer_snapshot_texture else {
             return false;
         };
         align_offset(instance_offset);
@@ -1676,8 +1732,17 @@ impl MetalRenderer {
             mem::size_of_val(&viewport_size) as u64,
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
+        command_encoder.set_fragment_bytes(
+            LensRectInputIndex::SceneBlurParams as u64,
+            mem::size_of::<SceneBlurParams>() as u64,
+            &scene_blur_params as *const SceneBlurParams as *const _,
+        );
         command_encoder
             .set_fragment_texture(LensRectInputIndex::BlurTexture as u64, Some(snapshot));
+        command_encoder.set_fragment_texture(
+            LensRectInputIndex::UnblurredTexture as u64,
+            Some(unblurred),
+        );
         command_encoder.set_fragment_sampler_state(
             LensRectInputIndex::BlurSampler as u64,
             Some(&self.blur_sampler),
@@ -2231,6 +2296,8 @@ enum BlurRectInputIndex {
     ViewportSize = 2,
     BlurTexture = 3,
     BlurSampler = 4,
+    UnblurredTexture = 5,
+    SceneBlurParams = 6,
 }
 
 #[repr(C)]
@@ -2241,6 +2308,21 @@ enum LensRectInputIndex {
     BlurTexture = 3,
     BlurSampler = 4,
     Shapes = 5,
+    UnblurredTexture = 6,
+    SceneBlurParams = 7,
+}
+
+/// Scene-wide blur parameters that the gradient-blur shaders use to
+/// normalize per-pixel strength. Written once per frame and bound to both
+/// `blur_rect` and `lens_rect` pipelines.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SceneBlurParams {
+    /// Maximum `blur_radius` anywhere in the scene (see
+    /// `Scene::max_blur_radius`). Used by the shader to scale per-pixel
+    /// gradient strength into a [0, 1] mix factor.
+    max_blur_radius: f32,
+    _pad: [f32; 3],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

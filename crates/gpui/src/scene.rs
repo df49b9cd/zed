@@ -192,17 +192,20 @@ impl Scene {
     }
 
     /// Maximum `blur_radius` requested by any `BlurRect` or `LensRect` in
-    /// the scene. Zero when neither primitive kind is present.
+    /// the scene. For gradient blurs, considers both endpoints (`radius`
+    /// and `radius_end`) — the bigger of the two determines how much
+    /// blurring the Kawase chain must be able to produce. Zero when
+    /// neither primitive kind is present.
     pub fn max_blur_radius(&self) -> ScaledPixels {
         let blur = self
             .blur_rects
             .iter()
-            .map(|b| b.blur_radius.0)
+            .map(|b| b.blur_radius.0.max(b.blur_radius_end.0))
             .fold(0.0_f32, f32::max);
         let lens = self
             .lens_rects
             .iter()
-            .map(|l| l.blur_radius.0)
+            .map(|l| l.blur_radius.0.max(l.blur_radius_end.0))
             .fold(0.0_f32, f32::max);
         ScaledPixels(blur.max(lens))
     }
@@ -665,6 +668,12 @@ impl From<Shadow> for Primitive {
 /// dual-Kawase blur, and composites the result with a tint. Used for
 /// backdrop-blurred materials like Apple's Liquid Glass.
 ///
+/// Supports uniform or linear-gradient blur strength: when
+/// `gradient_direction != [0, 0]`, the fragment shader interpolates
+/// `blur_radius_start -> blur_radius_end` along that axis and mixes between
+/// the un-blurred framebuffer and the maximum-blur output. Used for HIG
+/// scroll-edge fades.
+///
 /// Unlike `Quad` / `Shadow` / etc., a `BlurRect` is not drawn with an
 /// instanced pipeline — each one breaks the current render pass so the
 /// framebuffer can be sampled, then runs its own post-process chain before
@@ -679,12 +688,21 @@ pub struct BlurRect {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// Starting blur radius (in device pixels). For uniform blur, equals
+    /// `blur_radius_end`. The max of the two is what sizes the Kawase chain.
     pub blur_radius: ScaledPixels,
-    pub pad: f32,
+    /// Ending blur radius (in device pixels) for linear-gradient blur.
+    pub blur_radius_end: ScaledPixels,
+    /// Normalized gradient direction. `[0.0, 0.0]` means uniform blur.
+    pub gradient_direction: [f32; 2],
     pub tint: Hsla,
+    /// Pads the stride to 96 bytes so the WGSL `array<BlurRect>` matches
+    /// the Rust side (8-byte alignment required for the nested `vec2<f32>`
+    /// Bounds).
+    pub _pad_end: [f32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<BlurRect>() == 80);
+const _: () = assert!(std::mem::size_of::<BlurRect>() == 96);
 
 impl From<BlurRect> for Primitive {
     fn from(blur: BlurRect) -> Self {
@@ -699,6 +717,10 @@ impl From<BlurRect> for Primitive {
 /// merge field has room to settle. Per-shape `corner_radii` and `bounds`
 /// live on separate `LensShape` entries at
 /// `Scene::lens_shapes[shape_offset..shape_offset + shape_count]`.
+///
+/// Supports uniform or linear-gradient blur strength the same way
+/// [`BlurRect`] does: `gradient_direction != [0, 0]` enables a per-pixel
+/// interpolation between `blur_radius..blur_radius_end`.
 ///
 /// The field layout is kept in lockstep with the WGSL / MSL `LensRect`
 /// struct and padded to a 112-byte stride.
@@ -719,18 +741,19 @@ pub struct LensRect {
     /// Smooth-min radius, in pixels, used when merging overlapping shapes
     /// into a single SDF. 0 disables merging (hard min).
     pub edge_blend_distance: ScaledPixels,
-    /// Reserved for future use (Subsystem 2's variable-radius blur takes
-    /// four of the five remaining padding slots below).
-    pub _pad_a: f32,
+    /// Starting blur radius (in device pixels). For uniform blur, equals
+    /// `blur_radius_end`.
     pub blur_radius: ScaledPixels,
+    /// Normalized gradient direction. `[0.0, 0.0]` means uniform blur.
+    pub gradient_direction: [f32; 2],
+    /// Ending blur radius (in device pixels) for linear-gradient blur.
+    pub blur_radius_end: ScaledPixels,
     pub refraction: f32,
     pub depth: f32,
     pub dispersion: f32,
     pub splay: ScaledPixels,
     pub light_angle_radians: f32,
-    pub pad_light: f32,
     pub light_intensity: f32,
-    pub pad: f32,
     pub tint: Hsla,
     // Pads the struct to 112 bytes so its WGSL `array<LensRect>` stride
     // (rounded to 8-byte alignment for the nested `Bounds` `vec2<f32>`)
@@ -1164,13 +1187,15 @@ mod tests {
             content_mask: test_content_mask(),
             corner_radii: test_corners(),
             blur_radius: ScaledPixels(12.0),
-            pad: 0.0,
+            blur_radius_end: ScaledPixels(12.0),
+            gradient_direction: [0.0, 0.0],
             tint: Hsla {
                 h: 0.0,
                 s: 0.0,
                 l: 0.0,
                 a: 0.3,
             },
+            _pad_end: [0.0; 2],
         });
         scene.finish();
 
@@ -1205,16 +1230,15 @@ mod tests {
                 shape_offset: 0,
                 shape_count: 0,
                 edge_blend_distance: ScaledPixels(0.0),
-                _pad_a: 0.0,
                 blur_radius: ScaledPixels(8.0),
+                gradient_direction: [0.0, 0.0],
+                blur_radius_end: ScaledPixels(8.0),
                 refraction: 12.0,
                 depth: 6.0,
                 dispersion: 2.0,
                 splay: ScaledPixels(1.5),
                 light_angle_radians: std::f32::consts::FRAC_PI_4,
-                pad_light: 0.0,
                 light_intensity: 0.2,
-                pad: 0.0,
                 tint: Hsla {
                     h: 0.6,
                     s: 0.2,
@@ -1296,13 +1320,15 @@ mod tests {
             content_mask: test_content_mask(),
             corner_radii: test_corners(),
             blur_radius: ScaledPixels(12.0),
-            pad: 0.0,
+            blur_radius_end: ScaledPixels(12.0),
+            gradient_direction: [0.0, 0.0],
             tint: Hsla {
                 h: 0.0,
                 s: 0.0,
                 l: 0.0,
                 a: 0.3,
             },
+            _pad_end: [0.0; 2],
         }
     }
 

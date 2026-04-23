@@ -65,6 +65,7 @@ mod macos_build {
             "BlurRect".into(),
             "LensRect".into(),
             "LensShape".into(),
+            "SceneBlurParams".into(),
             "BlurIoInputIndex".into(),
             "BlurRectInputIndex".into(),
             "LensRectInputIndex".into(),
