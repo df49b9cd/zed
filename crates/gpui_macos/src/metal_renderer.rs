@@ -7,7 +7,7 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, BlurRect, Bounds, ContentMask, DevicePixels, LensRect,
+    AtlasTextureId, Background, BlurRect, Bounds, ContentMask, DevicePixels, LensRect, LensShape,
     MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
@@ -1059,6 +1059,7 @@ impl MetalRenderer {
                         if did_snapshot {
                             self.draw_lens_rects(
                                 rects,
+                                &scene.lens_shapes,
                                 instance_buffer,
                                 &mut instance_offset,
                                 viewport_size,
@@ -1596,6 +1597,7 @@ impl MetalRenderer {
     fn draw_lens_rects(
         &self,
         rects: &[LensRect],
+        shapes: &[LensShape],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1604,10 +1606,39 @@ impl MetalRenderer {
         if rects.is_empty() {
             return true;
         }
+        // Shapes cannot be empty if any rect references them; fail rather
+        // than bind a zero-length buffer (Metal doesn't accept that).
+        if shapes.is_empty() {
+            return false;
+        }
         let Some(ref snapshot) = self.blur_chain_textures[0] else {
             return false;
         };
         align_offset(instance_offset);
+        let rects_offset = *instance_offset;
+        let rects_bytes = mem::size_of_val(rects);
+        let after_rects = rects_offset + rects_bytes;
+        if after_rects > instance_buffer.size {
+            return false;
+        }
+        unsafe {
+            let dst =
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(rects_offset);
+            ptr::copy_nonoverlapping(rects.as_ptr() as *const u8, dst, rects_bytes);
+        }
+
+        let mut shapes_offset = after_rects;
+        align_offset(&mut shapes_offset);
+        let shapes_bytes = mem::size_of_val(shapes);
+        let after_shapes = shapes_offset + shapes_bytes;
+        if after_shapes > instance_buffer.size {
+            return false;
+        }
+        unsafe {
+            let dst =
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(shapes_offset);
+            ptr::copy_nonoverlapping(shapes.as_ptr() as *const u8, dst, shapes_bytes);
+        }
 
         command_encoder.set_render_pipeline_state(&self.lens_rect_pipeline_state);
         command_encoder.set_vertex_buffer(
@@ -1618,12 +1649,22 @@ impl MetalRenderer {
         command_encoder.set_vertex_buffer(
             LensRectInputIndex::Rects as u64,
             Some(&instance_buffer.metal_buffer),
-            *instance_offset as u64,
+            rects_offset as u64,
         );
         command_encoder.set_fragment_buffer(
             LensRectInputIndex::Rects as u64,
             Some(&instance_buffer.metal_buffer),
-            *instance_offset as u64,
+            rects_offset as u64,
+        );
+        command_encoder.set_vertex_buffer(
+            LensRectInputIndex::Shapes as u64,
+            Some(&instance_buffer.metal_buffer),
+            shapes_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            LensRectInputIndex::Shapes as u64,
+            Some(&instance_buffer.metal_buffer),
+            shapes_offset as u64,
         );
         command_encoder.set_vertex_bytes(
             LensRectInputIndex::ViewportSize as u64,
@@ -1642,24 +1683,13 @@ impl MetalRenderer {
             Some(&self.blur_sampler),
         );
 
-        let bytes_len = mem::size_of_val(rects);
-        let next_offset = *instance_offset + bytes_len;
-        if next_offset > instance_buffer.size {
-            return false;
-        }
-        let buffer_contents =
-            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
-        unsafe {
-            ptr::copy_nonoverlapping(rects.as_ptr() as *const u8, buffer_contents, bytes_len);
-        }
-
         command_encoder.draw_primitives_instanced(
             metal::MTLPrimitiveType::Triangle,
             0,
             6,
             rects.len() as u64,
         );
-        *instance_offset = next_offset;
+        *instance_offset = after_shapes;
         true
     }
 
@@ -2210,6 +2240,7 @@ enum LensRectInputIndex {
     ViewportSize = 2,
     BlurTexture = 3,
     BlurSampler = 4,
+    Shapes = 5,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

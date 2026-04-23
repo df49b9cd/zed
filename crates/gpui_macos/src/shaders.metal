@@ -1394,6 +1394,12 @@ fragment float4 blur_rect_fragment(
 }
 
 // --- LensRect: Liquid Glass composite (refraction + CA + Fresnel) ---
+//
+// Multi-shape lens: the fragment loops over
+// `rect.shape_offset..shape_offset + shape_count` in the `shapes` storage
+// buffer, computing a per-shape SDF + parabolic refraction direction, then
+// smooth-min-blends them by `rect.edge_blend_distance` so overlapping shapes
+// morph into one continuous lens.
 
 struct LensRectVarying {
   uint rect_id [[flat]];
@@ -1415,7 +1421,8 @@ vertex LensRectVarying lens_rect_vertex(
   uint rect_id [[instance_id]],
   constant float2 *unit_vertices [[buffer(LensRectInputIndex_Vertices)]],
   constant LensRect *rects [[buffer(LensRectInputIndex_Rects)]],
-  constant Size_DevicePixels *viewport_size [[buffer(LensRectInputIndex_ViewportSize)]]
+  constant Size_DevicePixels *viewport_size [[buffer(LensRectInputIndex_ViewportSize)]],
+  constant LensShape *shapes [[buffer(LensRectInputIndex_Shapes)]]
 ) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   LensRect rect = rects[rect_id];
@@ -1423,11 +1430,16 @@ vertex LensRectVarying lens_rect_vertex(
   out.position = to_device_position(unit_vertex, rect.bounds, viewport_size);
   out.rect_id = rect_id;
   out.light_dir = float2(cos(rect.light_angle_radians), sin(rect.light_angle_radians));
+  // Use the first shape's corner radii as the edge-band reference. Shapes
+  // in a union typically share a radius; if they don't, the visible
+  // difference in the Fresnel band width is minor compared to the other
+  // shader outputs.
+  LensShape shape0 = shapes[rect.shape_offset];
   float corner_avg = 0.25 * (
-    rect.corner_radii.top_left
-    + rect.corner_radii.top_right
-    + rect.corner_radii.bottom_right
-    + rect.corner_radii.bottom_left
+    shape0.corner_radii.top_left
+    + shape0.corner_radii.top_right
+    + shape0.corner_radii.bottom_right
+    + shape0.corner_radii.bottom_left
   );
   float splay_px = max(rect.splay, 1.0);
   out.edge_band = max(corner_avg * 0.5, splay_px);
@@ -1444,38 +1456,107 @@ fragment float4 lens_rect_fragment(
   constant LensRect *rects [[buffer(LensRectInputIndex_Rects)]],
   constant Size_DevicePixels *viewport_size [[buffer(LensRectInputIndex_ViewportSize)]],
   texture2d<float> blur_input [[texture(LensRectInputIndex_BlurTexture)]],
-  sampler blur_sampler [[sampler(LensRectInputIndex_BlurSampler)]]
+  sampler blur_sampler [[sampler(LensRectInputIndex_BlurSampler)]],
+  constant LensShape *shapes [[buffer(LensRectInputIndex_Shapes)]]
 ) {
   LensRect rect = rects[input.rect_id];
   float2 viewport_f = float2((float)viewport_size->width, (float)viewport_size->height);
 
-  float sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+  float2 frag_pos = input.position.xy;
+  uint shape_count = rect.shape_count;
+  if (shape_count == 0u) {
+    discard_fragment();
+  }
+  float blend_k = max(rect.edge_blend_distance, 0.0);
+  bool blend_shapes = blend_k > 0.0 && shape_count > 1u;
+
+  // Pass 1: accumulate per-shape SDFs; pick softmin/hardmin weights and
+  // tracked union SDF.
+  float per_shape_sdf[8];
+  float2 per_shape_dir[8];
+  float per_shape_norm_dist[8];
+  float min_sdf = 1e20;
+  for (uint i = 0u; i < shape_count; ++i) {
+    LensShape s = shapes[rect.shape_offset + i];
+    float d = quad_sdf(frag_pos, s.bounds, s.corner_radii);
+    per_shape_sdf[i] = d;
+    min_sdf = min(min_sdf, d);
+
+    float2 origin = float2(s.bounds.origin.x, s.bounds.origin.y);
+    float2 size = float2(s.bounds.size.width, s.bounds.size.height);
+    float2 center = origin + size * 0.5;
+    float2 half_size = size * 0.5;
+    float2 local_pos = frag_pos - center;
+    float local_len = length(local_pos);
+    per_shape_dir[i] = local_len > 0.001 ? local_pos / max(local_len, 0.0001) : float2(0.0, 0.0);
+    float2 safe_half = max(half_size, float2(1.0, 1.0));
+    per_shape_norm_dist[i] = clamp(length(local_pos / safe_half), 0.0, 1.0);
+  }
+
+  float union_sdf;
+  float weights[8];
+  float total_weight = 0.0;
+  if (blend_shapes) {
+    // Exponential smooth-minimum (polynomial order 8). Each weight is
+    // `exp(-d_i / k)`, normalized so they sum to 1. As `k -> 0` the weight
+    // on the minimum shape approaches 1 — identical to hard union.
+    float min_d = min_sdf;
+    for (uint i = 0u; i < shape_count; ++i) {
+      float w = exp(-(per_shape_sdf[i] - min_d) / blend_k);
+      weights[i] = w;
+      total_weight += w;
+    }
+    // Softmin value: -k * log(Σ exp(-d_i / k)), shifted by min_d to avoid
+    // overflow. Yields the smooth-min distance used for AA and Fresnel.
+    union_sdf = min_d - blend_k * log(max(total_weight, 1e-6));
+    // Normalize weights.
+    float inv_total = 1.0 / max(total_weight, 1e-6);
+    for (uint i = 0u; i < shape_count; ++i) {
+      weights[i] *= inv_total;
+    }
+  } else {
+    // Single shape or hard union: pick the min-SDF shape deterministically.
+    uint winner = 0u;
+    float min_d = per_shape_sdf[0];
+    for (uint i = 1u; i < shape_count; ++i) {
+      if (per_shape_sdf[i] < min_d) {
+        min_d = per_shape_sdf[i];
+        winner = i;
+      }
+    }
+    union_sdf = min_d;
+    for (uint i = 0u; i < shape_count; ++i) {
+      weights[i] = (i == winner) ? 1.0 : 0.0;
+    }
+  }
+
   const float antialias_threshold = 0.5;
-  float aa = saturate(antialias_threshold - sdf);
+  float aa = saturate(antialias_threshold - union_sdf);
   if (aa <= 0.0) {
     discard_fragment();
   }
 
-  float2 origin = float2(rect.bounds.origin.x, rect.bounds.origin.y);
-  float2 size = float2(rect.bounds.size.width, rect.bounds.size.height);
-  float2 center = origin + size * 0.5;
-  float2 half_size = size * 0.5;
-  float2 local_pos = input.position.xy - center;
-  float local_len = length(local_pos);
-  float2 direction = local_len > 0.001 ? local_pos / max(local_len, 0.0001) : float2(0.0, 0.0);
-  float2 safe_half = max(half_size, float2(1.0, 1.0));
-  float normalized_dist = clamp(length(local_pos / safe_half), 0.0, 1.0);
-
+  // Pass 2: weighted refraction offset. The per-shape parabolic distortion
+  // (`(1 - r^2) * direction * refraction / 2`) is softmin-weighted so fields
+  // from merging shapes blend instead of clipping.
   float depth_scale = clamp(rect.depth * 0.01, 0.0, 1.0);
-  float distortion = (1.0 - normalized_dist * normalized_dist) * (1.0 + depth_scale);
-  float2 offset_px = distortion * direction * rect.refraction * 0.5;
-  float2 base_uv = input.position.xy / viewport_f;
+  float2 offset_px = float2(0.0, 0.0);
+  float weighted_norm_dist = 0.0;
+  float2 weighted_dir = float2(0.0, 0.0);
+  for (uint i = 0u; i < shape_count; ++i) {
+    float nd = per_shape_norm_dist[i];
+    float distortion = (1.0 - nd * nd) * (1.0 + depth_scale);
+    offset_px += weights[i] * (distortion * per_shape_dir[i] * rect.refraction * 0.5);
+    weighted_norm_dist += weights[i] * nd;
+    weighted_dir += weights[i] * per_shape_dir[i];
+  }
+  float2 base_uv = frag_pos / viewport_f;
   float2 refracted_uv = base_uv - offset_px / viewport_f;
 
   float4 color;
   if (rect.dispersion > 0.0) {
-    float ca_shift = normalized_dist * rect.dispersion;
-    float2 ca_dir = direction / viewport_f;
+    float ca_shift = weighted_norm_dist * rect.dispersion;
+    float2 ca_dir = weighted_dir / viewport_f;
     color.r = blur_input.sample(blur_sampler, refracted_uv - ca_dir * ca_shift).r;
     color.g = blur_input.sample(blur_sampler, refracted_uv).g;
     color.b = blur_input.sample(blur_sampler, refracted_uv + ca_dir * ca_shift).b;
@@ -1488,9 +1569,12 @@ fragment float4 lens_rect_fragment(
   color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
   if (rect.light_intensity > 0.0) {
-    float edge_dist = fabs(sdf);
+    float edge_dist = fabs(union_sdf);
     float edge_falloff = smoothstep(input.edge_band, 0.0, edge_dist);
-    float facing = local_len > 0.001 ? clamp(dot(direction, input.light_dir), 0.0, 1.0) : 1.0;
+    float weighted_len = length(weighted_dir);
+    float facing = weighted_len > 0.001
+      ? clamp(dot(weighted_dir / weighted_len, input.light_dir), 0.0, 1.0)
+      : 1.0;
     float edge_glow = edge_falloff * facing * rect.light_intensity;
     color = color + float4(edge_glow, edge_glow, edge_glow, 0.0);
   }

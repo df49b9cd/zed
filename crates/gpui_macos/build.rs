@@ -64,6 +64,7 @@ mod macos_build {
             "TransformationMatrix".into(),
             "BlurRect".into(),
             "LensRect".into(),
+            "LensShape".into(),
             "BlurIoInputIndex".into(),
             "BlurRectInputIndex".into(),
             "LensRectInputIndex".into(),

@@ -6,8 +6,9 @@ use crate::{
     Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LensRect,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
+    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
+    LensPrimitive, LensRect, LensShape, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Radians, Render, RenderGlyphParams, RenderImage, RenderImageParams,
@@ -3432,6 +3433,35 @@ impl Window {
         corner_radii: Corners<Pixels>,
         effect: LensEffect,
     ) {
+        self.paint_lens_rect_union(
+            [LensShapeSpec {
+                bounds,
+                corner_radii,
+            }],
+            px(0.0),
+            effect,
+        );
+    }
+
+    /// Paint a Liquid Glass composite over the union of multiple rounded
+    /// rectangles. Shapes within `edge_blend_distance` of each other morph
+    /// into a single continuous lens via a smooth-minimum of their signed
+    /// distance fields — the GPU-side equivalent of SwiftUI's
+    /// `GlassEffectContainer(spacing:)`.
+    ///
+    /// `edge_blend_distance` of 0 disables merging: each shape contributes
+    /// its own refraction but they remain visually distinct where they
+    /// overlap. Accepts 1..=`MAX_LENS_SHAPES_PER_GROUP` shapes; violations
+    /// trip a `debug_assert!`.
+    ///
+    /// Same render-pass-break caveat as `paint_blur_rect` — keep the number
+    /// of lens rects per frame small.
+    pub fn paint_lens_rect_union(
+        &mut self,
+        shapes: impl IntoIterator<Item = LensShapeSpec>,
+        edge_blend_distance: Pixels,
+        effect: LensEffect,
+    ) {
         self.invalidator.debug_assert_paint();
         debug_assert!(
             effect.light_angle.0.is_finite(),
@@ -3447,23 +3477,66 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        self.next_frame.scene.insert_primitive(LensRect {
-            order: 0,
-            kernel_levels: effect.kernel_levels.clamp(1, 5),
-            bounds: bounds.scale(scale_factor),
-            content_mask: content_mask.scale(scale_factor),
-            corner_radii: corner_radii.scale(scale_factor),
-            blur_radius: effect.radius.scale(scale_factor),
-            refraction: effect.refraction * 100.0,
-            depth: effect.depth * 100.0,
-            dispersion: effect.dispersion * 100.0,
-            splay: effect.splay.scale(scale_factor),
-            light_angle_radians: effect.light_angle.0,
-            pad_light: 0.0,
-            light_intensity: effect.light_intensity,
-            pad: 0.0,
-            tint: effect.tint.opacity(opacity),
-            pad2: 0.0,
+
+        let mut specs: Vec<LensShapeSpec> = shapes.into_iter().collect();
+        debug_assert!(
+            !specs.is_empty(),
+            "paint_lens_rect_union requires at least one shape"
+        );
+        debug_assert!(
+            specs.len() <= MAX_LENS_SHAPES_PER_GROUP,
+            "paint_lens_rect_union accepts at most {MAX_LENS_SHAPES_PER_GROUP} shapes, got {}",
+            specs.len()
+        );
+        if specs.is_empty() {
+            return;
+        }
+        specs.truncate(MAX_LENS_SHAPES_PER_GROUP);
+
+        let mut union = specs[0].bounds;
+        for spec in specs.iter().skip(1) {
+            union = union.union(&spec.bounds);
+        }
+        let blend = edge_blend_distance.max(px(0.0));
+        let padded_origin = point(union.origin.x - blend, union.origin.y - blend);
+        let padded_size = size(union.size.width + blend * 2.0, union.size.height + blend * 2.0);
+        let padded_bounds = Bounds {
+            origin: padded_origin,
+            size: padded_size,
+        };
+
+        let scaled_shapes: Vec<LensShape> = specs
+            .into_iter()
+            .map(|spec| LensShape {
+                bounds: spec.bounds.scale(scale_factor),
+                corner_radii: spec.corner_radii.scale(scale_factor),
+                _pad: [0.0; 4],
+            })
+            .collect();
+
+        self.next_frame.scene.insert_primitive(LensPrimitive {
+            rect: LensRect {
+                order: 0,
+                kernel_levels: effect.kernel_levels.clamp(1, 5),
+                bounds: padded_bounds.scale(scale_factor),
+                content_mask: content_mask.scale(scale_factor),
+                shape_offset: 0,
+                shape_count: 0,
+                edge_blend_distance: blend.scale(scale_factor),
+                _pad_a: 0.0,
+                blur_radius: effect.radius.scale(scale_factor),
+                refraction: effect.refraction * 100.0,
+                depth: effect.depth * 100.0,
+                dispersion: effect.dispersion * 100.0,
+                splay: effect.splay.scale(scale_factor),
+                light_angle_radians: effect.light_angle.0,
+                pad_light: 0.0,
+                light_intensity: effect.light_intensity,
+                pad: 0.0,
+                tint: effect.tint.opacity(opacity),
+                pad2: 0.0,
+            },
+            shapes: scaled_shapes,
         });
     }
 
@@ -6080,4 +6153,19 @@ impl LensEffect {
             ..Default::default()
         }
     }
+}
+
+/// Maximum number of shapes in a single [`Window::paint_lens_rect_union`]
+/// call. Kept small so the per-fragment smooth-min loop stays cheap and the
+/// per-primitive GPU shape buffer is bounded.
+pub const MAX_LENS_SHAPES_PER_GROUP: usize = 8;
+
+/// A single rounded-rectangle shape inside a multi-shape lens group. Passed
+/// to [`Window::paint_lens_rect_union`].
+#[derive(Clone, Copy, Debug)]
+pub struct LensShapeSpec {
+    /// Bounds of this shape in window pixels.
+    pub bounds: Bounds<Pixels>,
+    /// Per-corner radii of this shape in window pixels.
+    pub corner_radii: Corners<Pixels>,
 }

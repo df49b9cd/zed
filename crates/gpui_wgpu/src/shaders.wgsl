@@ -1366,7 +1366,10 @@ struct LensRect {
     kernel_levels: u32,
     bounds: Bounds,
     content_mask: Bounds,
-    corner_radii: Corners,
+    shape_offset: u32,
+    shape_count: u32,
+    edge_blend_distance: f32,
+    _pad_a: f32,
     blur_radius: f32,
     refraction: f32,
     depth: f32,
@@ -1381,10 +1384,22 @@ struct LensRect {
     pad2: f32,
 }
 
+struct LensShape {
+    bounds: Bounds,
+    corner_radii: Corners,
+    // Pads the stride to 48 bytes so the WGSL `array<LensShape>` matches
+    // the Rust side.
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
+}
+
 @group(1) @binding(0) var<storage, read> b_blur_rects: array<BlurRect>;
 @group(1) @binding(1) var<storage, read> b_lens_rects: array<LensRect>;
 @group(1) @binding(2) var t_blur_input: texture_2d<f32>;
 @group(1) @binding(3) var s_blur_input: sampler;
+@group(1) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
 
 // --- BlurRect: rounded rect that samples the blurred framebuffer ---
 
@@ -1450,16 +1465,24 @@ fn vs_lens_rect(
         cos(rect.light_angle_radians),
         sin(rect.light_angle_radians),
     );
+    // Use the first shape's corner radii as the Fresnel edge-band reference;
+    // the difference when shapes differ is minor relative to the other
+    // shader outputs.
+    let shape0 = b_lens_shapes[rect.shape_offset];
     let corner_avg = 0.25 * (
-        rect.corner_radii.top_left
-        + rect.corner_radii.top_right
-        + rect.corner_radii.bottom_right
-        + rect.corner_radii.bottom_left
+        shape0.corner_radii.top_left
+        + shape0.corner_radii.top_right
+        + shape0.corner_radii.bottom_right
+        + shape0.corner_radii.bottom_left
     );
     let splay_px = max(rect.splay, 1.0);
     out.edge_band = max(corner_avg * 0.5, splay_px);
     return out;
 }
+
+// Max shapes per LensRect. Matches `MAX_LENS_SHAPES_PER_GROUP` in window.rs;
+// sized to keep the per-fragment loops cheap.
+const MAX_LENS_SHAPES: u32 = 8u;
 
 @fragment
 fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
@@ -1467,36 +1490,89 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
     let rect = b_lens_rects[input.rect_id];
+    let shape_count = min(rect.shape_count, MAX_LENS_SHAPES);
+    if (shape_count == 0u) {
+        return vec4<f32>(0.0);
+    }
+    let blend_k = max(rect.edge_blend_distance, 0.0);
+    let blend_shapes = blend_k > 0.0 && shape_count > 1u;
 
-    let sdf = quad_sdf(input.position.xy, rect.bounds, rect.corner_radii);
+    var per_shape_sdf: array<f32, 8>;
+    var per_shape_dir: array<vec2<f32>, 8>;
+    var per_shape_norm_dist: array<f32, 8>;
+    var min_sdf: f32 = 1e20;
+    for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+        let s = b_lens_shapes[rect.shape_offset + i];
+        let d = quad_sdf(input.position.xy, s.bounds, s.corner_radii);
+        per_shape_sdf[i] = d;
+        min_sdf = min(min_sdf, d);
+
+        let center = s.bounds.origin + s.bounds.size * 0.5;
+        let half_size = s.bounds.size * 0.5;
+        let local_pos = input.position.xy - center;
+        let local_len = length(local_pos);
+        per_shape_dir[i] = select(
+            vec2<f32>(0.0, 0.0),
+            local_pos / max(local_len, 0.0001),
+            local_len > 0.001,
+        );
+        let safe_half = max(half_size, vec2<f32>(1.0, 1.0));
+        per_shape_norm_dist[i] = clamp(length(local_pos / safe_half), 0.0, 1.0);
+    }
+
+    var union_sdf: f32;
+    var weights: array<f32, 8>;
+    if (blend_shapes) {
+        var total_weight: f32 = 0.0;
+        for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+            let w = exp(-(per_shape_sdf[i] - min_sdf) / blend_k);
+            weights[i] = w;
+            total_weight = total_weight + w;
+        }
+        union_sdf = min_sdf - blend_k * log(max(total_weight, 1e-6));
+        let inv_total = 1.0 / max(total_weight, 1e-6);
+        for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+            weights[i] = weights[i] * inv_total;
+        }
+    } else {
+        var winner: u32 = 0u;
+        var min_d: f32 = per_shape_sdf[0];
+        for (var i: u32 = 1u; i < shape_count; i = i + 1u) {
+            if (per_shape_sdf[i] < min_d) {
+                min_d = per_shape_sdf[i];
+                winner = i;
+            }
+        }
+        union_sdf = min_d;
+        for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+            weights[i] = select(0.0, 1.0, i == winner);
+        }
+    }
+
     let antialias_threshold = 0.5;
-    let aa = saturate(antialias_threshold - sdf);
+    let aa = saturate(antialias_threshold - union_sdf);
     if (aa <= 0.0) {
         return vec4<f32>(0.0);
     }
 
-    let center = rect.bounds.origin + rect.bounds.size * 0.5;
-    let half_size = rect.bounds.size * 0.5;
-    let local_pos = input.position.xy - center;
-    let local_len = length(local_pos);
-    let direction = select(
-        vec2<f32>(0.0, 0.0),
-        local_pos / max(local_len, 0.0001),
-        local_len > 0.001,
-    );
-    let safe_half = max(half_size, vec2<f32>(1.0, 1.0));
-    let normalized_dist = clamp(length(local_pos / safe_half), 0.0, 1.0);
-
     let depth_scale = clamp(rect.depth * 0.01, 0.0, 1.0);
-    let distortion = (1.0 - normalized_dist * normalized_dist) * (1.0 + depth_scale);
-    let offset_px = distortion * direction * rect.refraction * 0.5;
+    var offset_px = vec2<f32>(0.0, 0.0);
+    var weighted_norm_dist: f32 = 0.0;
+    var weighted_dir = vec2<f32>(0.0, 0.0);
+    for (var i: u32 = 0u; i < shape_count; i = i + 1u) {
+        let nd = per_shape_norm_dist[i];
+        let distortion = (1.0 - nd * nd) * (1.0 + depth_scale);
+        offset_px = offset_px + weights[i] * (distortion * per_shape_dir[i] * rect.refraction * 0.5);
+        weighted_norm_dist = weighted_norm_dist + weights[i] * nd;
+        weighted_dir = weighted_dir + weights[i] * per_shape_dir[i];
+    }
     let base_uv = input.position.xy / globals.viewport_size;
     let refracted_uv = base_uv - offset_px / globals.viewport_size;
 
     var color: vec4<f32>;
     if (rect.dispersion > 0.0) {
-        let ca_shift = normalized_dist * rect.dispersion;
-        let ca_dir = direction / globals.viewport_size;
+        let ca_shift = weighted_norm_dist * rect.dispersion;
+        let ca_dir = weighted_dir / globals.viewport_size;
         color.r = textureSample(t_blur_input, s_blur_input, refracted_uv - ca_dir * ca_shift).r;
         color.g = textureSample(t_blur_input, s_blur_input, refracted_uv).g;
         color.b = textureSample(t_blur_input, s_blur_input, refracted_uv + ca_dir * ca_shift).b;
@@ -1509,12 +1585,13 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
     if (rect.light_intensity > 0.0) {
-        let edge_dist = abs(sdf);
+        let edge_dist = abs(union_sdf);
         let edge_falloff = smoothstep(input.edge_band, 0.0, edge_dist);
+        let weighted_len = length(weighted_dir);
         let facing = select(
             1.0,
-            clamp(dot(direction, input.light_dir), 0.0, 1.0),
-            local_len > 0.001,
+            clamp(dot(weighted_dir / weighted_len, input.light_dir), 0.0, 1.0),
+            weighted_len > 0.001,
         );
         let edge_glow = edge_falloff * facing * rect.light_intensity;
         color = color + vec4<f32>(edge_glow, edge_glow, edge_glow, 0.0);

@@ -38,6 +38,11 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     pub blur_rects: Vec<BlurRect>,
     pub lens_rects: Vec<LensRect>,
+    /// Per-shape data for `LensRect`s that represent a multi-shape union.
+    /// Each `LensRect` points at a `shape_offset..shape_offset+shape_count`
+    /// slice of this vec. Shapes are never reordered after insertion, so the
+    /// offsets stored in `lens_rects` survive `finish()`'s sort.
+    pub lens_shapes: Vec<LensShape>,
 }
 
 #[expect(missing_docs)]
@@ -56,6 +61,7 @@ impl Scene {
         self.surfaces.clear();
         self.blur_rects.clear();
         self.lens_rects.clear();
+        self.lens_shapes.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -128,8 +134,11 @@ impl Scene {
                 self.blur_rects.push(*blur);
             }
             Primitive::LensRect(lens) => {
-                lens.order = order;
-                self.lens_rects.push(*lens);
+                lens.rect.order = order;
+                lens.rect.shape_offset = self.lens_shapes.len() as u32;
+                lens.rect.shape_count = lens.shapes.len() as u32;
+                self.lens_shapes.extend_from_slice(&lens.shapes);
+                self.lens_rects.push(lens.rect);
             }
         }
         self.paint_operations
@@ -271,7 +280,17 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     BlurRect(BlurRect),
-    LensRect(LensRect),
+    LensRect(LensPrimitive),
+}
+
+/// A `LensRect` header paired with its per-shape union inputs. Round-trips
+/// through `PaintOperation::Primitive` so `Scene::replay` can repopulate
+/// `Scene::lens_shapes` with fresh offsets.
+#[derive(Clone, Debug)]
+#[expect(missing_docs)]
+pub struct LensPrimitive {
+    pub rect: LensRect,
+    pub shapes: Vec<LensShape>,
 }
 
 #[expect(missing_docs)]
@@ -287,7 +306,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BlurRect(blur) => &blur.bounds,
-            Primitive::LensRect(lens) => &lens.bounds,
+            Primitive::LensRect(lens) => &lens.rect.bounds,
         }
     }
 
@@ -302,7 +321,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BlurRect(blur) => &blur.content_mask,
-            Primitive::LensRect(lens) => &lens.content_mask,
+            Primitive::LensRect(lens) => &lens.rect.content_mask,
         }
     }
 }
@@ -673,10 +692,16 @@ impl From<BlurRect> for Primitive {
     }
 }
 
-/// A rounded rectangle with a full Liquid Glass composite: backdrop blur
-/// plus parabolic refraction, chromatic aberration, and a directional
-/// Fresnel edge highlight. Field layout is kept in lockstep with the WGSL
-/// / MSL `LensRect` struct and padded to a 112-byte stride.
+/// A rounded-rectangle group with a full Liquid Glass composite: backdrop
+/// blur plus parabolic refraction, chromatic aberration, and a directional
+/// Fresnel edge highlight. `bounds` is the union AABB of the shapes this
+/// primitive covers, expanded by `edge_blend_distance` on all sides so the
+/// merge field has room to settle. Per-shape `corner_radii` and `bounds`
+/// live on separate `LensShape` entries at
+/// `Scene::lens_shapes[shape_offset..shape_offset + shape_count]`.
+///
+/// The field layout is kept in lockstep with the WGSL / MSL `LensRect`
+/// struct and padded to a 112-byte stride.
 ///
 /// Same caveat as `BlurRect`: each `LensRect` forces a render-pass break.
 #[derive(Debug, Clone, Copy)]
@@ -687,7 +712,16 @@ pub struct LensRect {
     pub kernel_levels: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub corner_radii: Corners<ScaledPixels>,
+    /// Index into `Scene::lens_shapes` of this lens's first shape.
+    pub shape_offset: u32,
+    /// Number of shapes in this lens (1..=`MAX_LENS_SHAPES_PER_GROUP`).
+    pub shape_count: u32,
+    /// Smooth-min radius, in pixels, used when merging overlapping shapes
+    /// into a single SDF. 0 disables merging (hard min).
+    pub edge_blend_distance: ScaledPixels,
+    /// Reserved for future use (Subsystem 2's variable-radius blur takes
+    /// four of the five remaining padding slots below).
+    pub _pad_a: f32,
     pub blur_radius: ScaledPixels,
     pub refraction: f32,
     pub depth: f32,
@@ -706,11 +740,29 @@ pub struct LensRect {
 
 const _: () = assert!(std::mem::size_of::<LensRect>() == 112);
 
-impl From<LensRect> for Primitive {
-    fn from(lens: LensRect) -> Self {
+impl From<LensPrimitive> for Primitive {
+    fn from(lens: LensPrimitive) -> Self {
         Primitive::LensRect(lens)
     }
 }
+
+/// One shape in a multi-shape `LensRect` union. The lens fragment shader
+/// computes a signed distance to each shape, combines them with a smooth-min
+/// weighted by `LensRect::edge_blend_distance`, and refracts against the
+/// resulting field — letting overlapping shapes visually morph into one.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct LensShape {
+    pub bounds: Bounds<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Pads the struct to 48 bytes so its WGSL `array<LensShape>` stride
+    /// (rounded to 8-byte alignment for the nested `Bounds` `vec2<f32>`)
+    /// matches the Rust storage-buffer stride.
+    pub _pad: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<LensShape>() == 48);
 
 /// The style of a border.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -1071,7 +1123,7 @@ impl PathVertex<Pixels> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlurRect, LensRect, PrimitiveBatch, Quad, Scene};
+    use super::{BlurRect, LensPrimitive, LensRect, LensShape, PrimitiveBatch, Quad, Scene};
     use crate::{
         Background, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, ScaledPixels, point,
         size,
@@ -1135,36 +1187,57 @@ mod tests {
         );
     }
 
+    fn test_lens_shape() -> LensShape {
+        LensShape {
+            bounds: test_bounds(),
+            corner_radii: test_corners(),
+            _pad: [0.0; 4],
+        }
+    }
+
+    fn make_lens_primitive() -> LensPrimitive {
+        LensPrimitive {
+            rect: LensRect {
+                order: 0,
+                kernel_levels: 3,
+                bounds: test_bounds(),
+                content_mask: test_content_mask(),
+                shape_offset: 0,
+                shape_count: 0,
+                edge_blend_distance: ScaledPixels(0.0),
+                _pad_a: 0.0,
+                blur_radius: ScaledPixels(8.0),
+                refraction: 12.0,
+                depth: 6.0,
+                dispersion: 2.0,
+                splay: ScaledPixels(1.5),
+                light_angle_radians: std::f32::consts::FRAC_PI_4,
+                pad_light: 0.0,
+                light_intensity: 0.2,
+                pad: 0.0,
+                tint: Hsla {
+                    h: 0.6,
+                    s: 0.2,
+                    l: 0.8,
+                    a: 0.1,
+                },
+                pad2: 0.0,
+            },
+            shapes: vec![test_lens_shape()],
+        }
+    }
+
     #[test]
     fn lens_rect_round_trip() {
         let mut scene = Scene::default();
-        scene.insert_primitive(LensRect {
-            order: 0,
-            kernel_levels: 3,
-            bounds: test_bounds(),
-            content_mask: test_content_mask(),
-            corner_radii: test_corners(),
-            blur_radius: ScaledPixels(8.0),
-            refraction: 12.0,
-            depth: 6.0,
-            dispersion: 2.0,
-            splay: ScaledPixels(1.5),
-            light_angle_radians: std::f32::consts::FRAC_PI_4,
-            pad_light: 0.0,
-            light_intensity: 0.2,
-            pad: 0.0,
-            tint: Hsla {
-                h: 0.6,
-                s: 0.2,
-                l: 0.8,
-                a: 0.1,
-            },
-            pad2: 0.0,
-        });
+        scene.insert_primitive(make_lens_primitive());
         scene.finish();
 
         assert_eq!(scene.lens_rects.len(), 1);
+        assert_eq!(scene.lens_shapes.len(), 1);
         assert!(scene.blur_rects.is_empty());
+        assert_eq!(scene.lens_rects[0].shape_offset, 0);
+        assert_eq!(scene.lens_rects[0].shape_count, 1);
 
         let batches: Vec<_> = scene.batches().collect();
         assert!(
@@ -1174,6 +1247,45 @@ mod tests {
             "expected a LensRects batch of size 1, got {:?}",
             batches
         );
+    }
+
+    #[test]
+    fn lens_rect_multi_shape_roundtrip() {
+        let mut scene = Scene::default();
+        let mut lens = make_lens_primitive();
+        lens.shapes = (0..8).map(|_| test_lens_shape()).collect();
+        scene.insert_primitive(lens);
+        scene.finish();
+
+        assert_eq!(scene.lens_rects.len(), 1);
+        assert_eq!(scene.lens_shapes.len(), 8);
+        assert_eq!(scene.lens_rects[0].shape_offset, 0);
+        assert_eq!(scene.lens_rects[0].shape_count, 8);
+    }
+
+    #[test]
+    fn lens_shapes_survive_lens_rect_sort() {
+        let mut scene = Scene::default();
+        // Insert two lens primitives in reverse draw order; lens_shapes must
+        // still be indexable by the final, sorted lens_rects.
+        for (draw_order, shape_count) in [(5u32, 3usize), (1u32, 2usize)] {
+            let mut lens = make_lens_primitive();
+            lens.rect.order = draw_order;
+            lens.shapes = (0..shape_count).map(|_| test_lens_shape()).collect();
+            scene.insert_primitive(lens);
+        }
+        scene.finish();
+
+        assert_eq!(scene.lens_rects.len(), 2);
+        assert_eq!(scene.lens_shapes.len(), 5);
+        // After sort by order, the lower-order lens (2 shapes) comes first.
+        // Its shape_offset was set at insertion time and must still address
+        // a valid slice of lens_shapes.
+        for lens in &scene.lens_rects {
+            let start = lens.shape_offset as usize;
+            let end = start + lens.shape_count as usize;
+            assert!(end <= scene.lens_shapes.len());
+        }
     }
 
     fn make_blur_rect() -> BlurRect {
@@ -1272,29 +1384,20 @@ mod tests {
         blur.blur_radius = ScaledPixels(8.0);
         scene.insert_primitive(blur);
 
-        scene.insert_primitive(LensRect {
-            order: 0,
-            kernel_levels: 3,
-            bounds: test_bounds(),
-            content_mask: test_content_mask(),
-            corner_radii: test_corners(),
-            blur_radius: ScaledPixels(24.0),
-            refraction: 12.0,
-            depth: 6.0,
-            dispersion: 0.0,
-            splay: ScaledPixels(1.5),
-            light_angle_radians: 0.0,
-            pad_light: 0.0,
-            light_intensity: 0.0,
-            pad: 0.0,
-            tint: Hsla {
-                h: 0.0,
-                s: 0.0,
-                l: 0.0,
-                a: 0.0,
-            },
-            pad2: 0.0,
-        });
+        let mut lens = make_lens_primitive();
+        lens.rect.blur_radius = ScaledPixels(24.0);
+        lens.rect.dispersion = 0.0;
+        lens.rect.light_intensity = 0.0;
+        lens.rect.light_angle_radians = 0.0;
+        lens.rect.refraction = 12.0;
+        lens.rect.depth = 6.0;
+        lens.rect.tint = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.0,
+            a: 0.0,
+        };
+        scene.insert_primitive(lens);
         scene.finish();
 
         assert_eq!(scene.max_blur_radius(), ScaledPixels(24.0));

@@ -1,7 +1,7 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, BlurRect, Bounds, DevicePixels, GpuSpecs, LensRect,
+    AtlasTextureId, Background, BlurRect, Bounds, DevicePixels, GpuSpecs, LensRect, LensShape,
     MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
     Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
@@ -784,6 +784,7 @@ impl WgpuRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                storage_buffer_entry(4),
             ],
         });
 
@@ -1768,7 +1769,12 @@ impl WgpuRenderer {
                             });
 
                             if did_snapshot {
-                                self.draw_lens_rects(rects, &mut instance_offset, &mut pass)
+                                self.draw_lens_rects(
+                                    rects,
+                                    &scene.lens_shapes,
+                                    &mut instance_offset,
+                                    &mut pass,
+                                )
                             } else {
                                 true
                             }
@@ -2205,14 +2211,26 @@ impl WgpuRenderer {
     fn draw_lens_rects(
         &self,
         rects: &[LensRect],
+        shapes: &[LensShape],
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         if rects.is_empty() {
             return true;
         }
-        let data = unsafe { Self::instance_bytes(rects) };
-        let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
+        if shapes.is_empty() {
+            return false;
+        }
+        let rects_data = unsafe { Self::instance_bytes(rects) };
+        let Some((rects_offset, rects_size)) =
+            self.write_to_instance_buffer(instance_offset, rects_data)
+        else {
+            return false;
+        };
+        let shapes_data = unsafe { Self::instance_bytes(shapes) };
+        let Some((shapes_offset, shapes_size)) =
+            self.write_to_instance_buffer(instance_offset, shapes_data)
+        else {
             return false;
         };
         let resources = self.resources();
@@ -2227,7 +2245,7 @@ impl WgpuRenderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: self.instance_binding(offset, size),
+                        resource: self.instance_binding(rects_offset, rects_size),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -2236,6 +2254,10 @@ impl WgpuRenderer {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.instance_binding(shapes_offset, shapes_size),
                     },
                 ],
             });
