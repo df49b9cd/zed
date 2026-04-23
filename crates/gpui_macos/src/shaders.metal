@@ -1373,61 +1373,69 @@ vertex BlurRectVarying blur_rect_vertex(
   return out;
 }
 
-// Compute the per-pixel mix factor between the un-blurred and max-blurred
-// sources for a linear-gradient blur. Returns 1.0 (full blur) when the
-// gradient is disabled (`gradient_direction == 0`).
-//
-// This is a `mix(unblurred, max-blurred, t)` approximation. It's visually
-// plausible for HIG scroll-edge fades but not a true per-pixel Gaussian.
-// Mid-range `t` values diverge from a true variable-radius blur; the
-// documented follow-up (mip-pyramid sampling of preserved downsample
-// intermediates) is out of scope for this change.
-float gradient_blur_strength(
+// Compute the per-pixel target blur radius for a linear-gradient blur.
+// Uniform-blur paths (gradient_direction == 0) return `radius_start`.
+float gradient_target_radius(
     float2 frag_pos,
     Bounds_ScaledPixels bounds,
     float radius_start,
     float radius_end,
-    float2 gradient_direction,
-    float scene_max_radius
+    float2 gradient_direction
 ) {
-  if (scene_max_radius <= 0.0) {
-    return 0.0;
-  }
   float dir_len2 = dot(gradient_direction, gradient_direction);
   if (dir_len2 < 1e-6) {
-    return clamp(radius_start / scene_max_radius, 0.0, 1.0);
+    return radius_start;
   }
   float2 local = frag_pos - float2(bounds.origin.x, bounds.origin.y);
   float2 size_v = float2(bounds.size.width, bounds.size.height);
   float extent = max(dot(size_v, gradient_direction), 1.0);
   float t = clamp(dot(local, gradient_direction) / extent, 0.0, 1.0);
-  float target = mix(radius_start, radius_end, t);
-  return clamp(target / scene_max_radius, 0.0, 1.0);
+  return mix(radius_start, radius_end, t);
+}
+
+// Sample the preserved Kawase downsample pyramid at a per-pixel blur
+// radius. Mip level 0 is the un-blurred framebuffer; each subsequent mip
+// is a /2-sized Kawase downsample of the previous, so the effective
+// Gaussian sigma roughly doubles per level. Choosing
+// `level = kernel_levels + log2(strength)` matches this exponential
+// spacing — doubling the target radius bumps level by 1 — and trilinear
+// filtering between mips produces a smooth per-pixel variable-radius
+// blur.
+float4 sample_blur_pyramid(
+    texture2d<float> pyramid,
+    sampler pyramid_sampler,
+    float2 uv,
+    float target_radius,
+    constant SceneBlurParams *scene_blur
+) {
+  if (scene_blur->max_blur_radius <= 0.0) {
+    return pyramid.sample(pyramid_sampler, uv, level(0.0));
+  }
+  float strength = clamp(target_radius / scene_blur->max_blur_radius, 0.0, 1.0);
+  float level_f = scene_blur->kernel_levels + log2(max(strength, 1e-6));
+  level_f = clamp(level_f, 0.0, scene_blur->kernel_levels);
+  return pyramid.sample(pyramid_sampler, uv, level(level_f));
 }
 
 fragment float4 blur_rect_fragment(
   BlurRectFragmentInput input [[stage_in]],
   constant BlurRect *rects [[buffer(BlurRectInputIndex_Rects)]],
   constant Size_DevicePixels *viewport_size [[buffer(BlurRectInputIndex_ViewportSize)]],
-  texture2d<float> blur_input [[texture(BlurRectInputIndex_BlurTexture)]],
+  texture2d<float> blur_pyramid [[texture(BlurRectInputIndex_BlurPyramid)]],
   sampler blur_sampler [[sampler(BlurRectInputIndex_BlurSampler)]],
-  texture2d<float> unblurred_input [[texture(BlurRectInputIndex_UnblurredTexture)]],
   constant SceneBlurParams *scene_blur [[buffer(BlurRectInputIndex_SceneBlurParams)]]
 ) {
   BlurRect rect = rects[input.rect_id];
   float2 viewport_f = float2((float)viewport_size->width, (float)viewport_size->height);
   float2 fb_uv = input.position.xy / viewport_f;
-  float strength = gradient_blur_strength(
+  float target_radius = gradient_target_radius(
     input.position.xy,
     rect.bounds,
     rect.blur_radius,
     rect.blur_radius_end,
-    float2(rect.gradient_direction[0], rect.gradient_direction[1]),
-    scene_blur->max_blur_radius
+    float2(rect.gradient_direction[0], rect.gradient_direction[1])
   );
-  float4 blurred = blur_input.sample(blur_sampler, fb_uv);
-  float4 sharp = unblurred_input.sample(blur_sampler, fb_uv);
-  float4 color = mix(sharp, blurred, strength);
+  float4 color = sample_blur_pyramid(blur_pyramid, blur_sampler, fb_uv, target_radius, scene_blur);
   float4 tint_rgba = hsla_to_rgba(rect.tint);
   color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
@@ -1499,10 +1507,9 @@ fragment float4 lens_rect_fragment(
   LensRectFragmentInput input [[stage_in]],
   constant LensRect *rects [[buffer(LensRectInputIndex_Rects)]],
   constant Size_DevicePixels *viewport_size [[buffer(LensRectInputIndex_ViewportSize)]],
-  texture2d<float> blur_input [[texture(LensRectInputIndex_BlurTexture)]],
+  texture2d<float> blur_pyramid [[texture(LensRectInputIndex_BlurPyramid)]],
   sampler blur_sampler [[sampler(LensRectInputIndex_BlurSampler)]],
   constant LensShape *shapes [[buffer(LensRectInputIndex_Shapes)]],
-  texture2d<float> unblurred_input [[texture(LensRectInputIndex_UnblurredTexture)]],
   constant SceneBlurParams *scene_blur [[buffer(LensRectInputIndex_SceneBlurParams)]]
 ) {
   LensRect rect = rects[input.rect_id];
@@ -1598,13 +1605,12 @@ fragment float4 lens_rect_fragment(
   }
   float2 base_uv = frag_pos / viewport_f;
   float2 refracted_uv = base_uv - offset_px / viewport_f;
-  float strength = gradient_blur_strength(
+  float target_radius = gradient_target_radius(
     frag_pos,
     rect.bounds,
     rect.blur_radius,
     rect.blur_radius_end,
-    float2(rect.gradient_direction[0], rect.gradient_direction[1]),
-    scene_blur->max_blur_radius
+    float2(rect.gradient_direction[0], rect.gradient_direction[1])
   );
 
   float4 color;
@@ -1613,25 +1619,11 @@ fragment float4 lens_rect_fragment(
     float2 ca_dir = weighted_dir / viewport_f;
     float2 uv_r = refracted_uv - ca_dir * ca_shift;
     float2 uv_b = refracted_uv + ca_dir * ca_shift;
-    color.r = mix(
-      unblurred_input.sample(blur_sampler, uv_r).r,
-      blur_input.sample(blur_sampler, uv_r).r,
-      strength
-    );
-    color.g = mix(
-      unblurred_input.sample(blur_sampler, refracted_uv).g,
-      blur_input.sample(blur_sampler, refracted_uv).g,
-      strength
-    );
-    color.b = mix(
-      unblurred_input.sample(blur_sampler, uv_b).b,
-      blur_input.sample(blur_sampler, uv_b).b,
-      strength
-    );
+    color.r = sample_blur_pyramid(blur_pyramid, blur_sampler, uv_r, target_radius, scene_blur).r;
+    color.g = sample_blur_pyramid(blur_pyramid, blur_sampler, refracted_uv, target_radius, scene_blur).g;
+    color.b = sample_blur_pyramid(blur_pyramid, blur_sampler, uv_b, target_radius, scene_blur).b;
   } else {
-    float4 blurred = blur_input.sample(blur_sampler, refracted_uv);
-    float4 sharp = unblurred_input.sample(blur_sampler, refracted_uv);
-    color = mix(sharp, blurred, strength);
+    color = sample_blur_pyramid(blur_pyramid, blur_sampler, refracted_uv, target_radius, scene_blur);
   }
   color.a = 1.0;
 
@@ -1694,9 +1686,8 @@ fragment float4 mirror_rect_fragment(
   MirrorRectFragmentInput input [[stage_in]],
   constant MirrorRect *rects [[buffer(MirrorRectInputIndex_Rects)]],
   constant Size_DevicePixels *viewport_size [[buffer(MirrorRectInputIndex_ViewportSize)]],
-  texture2d<float> blur_input [[texture(MirrorRectInputIndex_BlurTexture)]],
+  texture2d<float> blur_pyramid [[texture(MirrorRectInputIndex_BlurPyramid)]],
   sampler blur_sampler [[sampler(MirrorRectInputIndex_BlurSampler)]],
-  texture2d<float> unblurred_input [[texture(MirrorRectInputIndex_UnblurredTexture)]],
   constant SceneBlurParams *scene_blur [[buffer(MirrorRectInputIndex_SceneBlurParams)]]
 ) {
   MirrorRect rect = rects[input.rect_id];
@@ -1725,17 +1716,14 @@ fragment float4 mirror_rect_fragment(
     return float4(0.0);
   }
 
-  float strength = gradient_blur_strength(
+  float target_radius = gradient_target_radius(
     input.position.xy,
     rect.bounds,
     rect.blur_radius,
     rect.blur_radius_end,
-    float2(rect.gradient_direction[0], rect.gradient_direction[1]),
-    scene_blur->max_blur_radius
+    float2(rect.gradient_direction[0], rect.gradient_direction[1])
   );
-  float4 blurred = blur_input.sample(blur_sampler, src_uv);
-  float4 sharp = unblurred_input.sample(blur_sampler, src_uv);
-  float4 color = mix(sharp, blurred, strength);
+  float4 color = sample_blur_pyramid(blur_pyramid, blur_sampler, src_uv, target_radius, scene_blur);
 
   float4 tint_rgba = hsla_to_rgba(rect.tint);
   color = float4(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);

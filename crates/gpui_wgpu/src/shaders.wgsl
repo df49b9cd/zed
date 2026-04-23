@@ -1388,9 +1388,9 @@ struct LensRect {
 
 struct SceneBlurParams {
     max_blur_radius: f32,
+    kernel_levels: f32,
     _pad0: f32,
     _pad1: f32,
-    _pad2: f32,
 }
 
 struct LensShape {
@@ -1421,10 +1421,12 @@ struct MirrorRect {
 
 @group(1) @binding(0) var<storage, read> b_blur_rects: array<BlurRect>;
 @group(1) @binding(1) var<storage, read> b_lens_rects: array<LensRect>;
-@group(1) @binding(2) var t_blur_input: texture_2d<f32>;
+// Mipmapped pyramid: mip 0 = un-blurred framebuffer snapshot, each
+// subsequent mip = Kawase downsample result of the previous level.
+// Fragment shaders pick fractional LOD via `textureSampleLevel`.
+@group(1) @binding(2) var t_blur_pyramid: texture_2d<f32>;
 @group(1) @binding(3) var s_blur_input: sampler;
 @group(1) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
-@group(1) @binding(5) var t_unblurred_input: texture_2d<f32>;
 @group(1) @binding(6) var<uniform> scene_blur: SceneBlurParams;
 @group(1) @binding(7) var<storage, read> b_mirror_rects: array<MirrorRect>;
 
@@ -1450,28 +1452,37 @@ fn vs_blur_rect(
     return out;
 }
 
-// Compute per-pixel blur-strength mix factor for linear-gradient blur. See
-// the Metal implementation for notes on the mix-approximation caveat.
-fn gradient_blur_strength(
+// Compute the per-pixel target blur radius for a linear-gradient blur.
+// Uniform-blur paths (gradient_direction == 0) return `radius_start`.
+fn gradient_target_radius(
     frag_pos: vec2<f32>,
     bounds: Bounds,
     radius_start: f32,
     radius_end: f32,
     gradient_direction: vec2<f32>,
-    scene_max_radius: f32,
 ) -> f32 {
-    if (scene_max_radius <= 0.0) {
-        return 0.0;
-    }
     let dir_len2 = dot(gradient_direction, gradient_direction);
     if (dir_len2 < 1e-6) {
-        return clamp(radius_start / scene_max_radius, 0.0, 1.0);
+        return radius_start;
     }
     let local = frag_pos - bounds.origin;
     let extent = max(dot(bounds.size, gradient_direction), 1.0);
     let t = clamp(dot(local, gradient_direction) / extent, 0.0, 1.0);
-    let target_radius = mix(radius_start, radius_end, t);
-    return clamp(target_radius / scene_max_radius, 0.0, 1.0);
+    return mix(radius_start, radius_end, t);
+}
+
+// Sample the preserved Kawase downsample pyramid at a per-pixel blur
+// radius. Mip 0 is un-blurred; each subsequent mip doubles the effective
+// Gaussian sigma, so `level = kernel_levels + log2(strength)` with
+// trilinear filtering produces a smooth per-pixel variable-radius blur.
+fn sample_blur_pyramid(uv: vec2<f32>, target_radius: f32) -> vec4<f32> {
+    if (scene_blur.max_blur_radius <= 0.0) {
+        return textureSampleLevel(t_blur_pyramid, s_blur_input, uv, 0.0);
+    }
+    let strength = clamp(target_radius / scene_blur.max_blur_radius, 0.0, 1.0);
+    let raw_level = scene_blur.kernel_levels + log2(max(strength, 1e-6));
+    let level = clamp(raw_level, 0.0, scene_blur.kernel_levels);
+    return textureSampleLevel(t_blur_pyramid, s_blur_input, uv, level);
 }
 
 @fragment
@@ -1481,17 +1492,14 @@ fn fs_blur_rect(input: BlurRectVarying) -> @location(0) vec4<f32> {
     }
     let rect = b_blur_rects[input.rect_id];
     let fb_uv = input.position.xy / globals.viewport_size;
-    let blurred = textureSample(t_blur_input, s_blur_input, fb_uv);
-    let sharp = textureSample(t_unblurred_input, s_blur_input, fb_uv);
-    let strength = gradient_blur_strength(
+    let target_radius = gradient_target_radius(
         input.position.xy,
         rect.bounds,
         rect.blur_radius,
         rect.blur_radius_end,
         rect.gradient_direction,
-        scene_blur.max_blur_radius,
     );
-    var color = mix(sharp, blurred, strength);
+    var color = sample_blur_pyramid(fb_uv, target_radius);
     let tint_rgba = hsla_to_rgba(rect.tint);
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);
 
@@ -1629,13 +1637,12 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
     }
     let base_uv = input.position.xy / globals.viewport_size;
     let refracted_uv = base_uv - offset_px / globals.viewport_size;
-    let strength = gradient_blur_strength(
+    let target_radius = gradient_target_radius(
         input.position.xy,
         rect.bounds,
         rect.blur_radius,
         rect.blur_radius_end,
         rect.gradient_direction,
-        scene_blur.max_blur_radius,
     );
 
     var color: vec4<f32>;
@@ -1644,25 +1651,11 @@ fn fs_lens_rect(input: LensRectVarying) -> @location(0) vec4<f32> {
         let ca_dir = weighted_dir / globals.viewport_size;
         let uv_r = refracted_uv - ca_dir * ca_shift;
         let uv_b = refracted_uv + ca_dir * ca_shift;
-        color.r = mix(
-            textureSample(t_unblurred_input, s_blur_input, uv_r).r,
-            textureSample(t_blur_input, s_blur_input, uv_r).r,
-            strength,
-        );
-        color.g = mix(
-            textureSample(t_unblurred_input, s_blur_input, refracted_uv).g,
-            textureSample(t_blur_input, s_blur_input, refracted_uv).g,
-            strength,
-        );
-        color.b = mix(
-            textureSample(t_unblurred_input, s_blur_input, uv_b).b,
-            textureSample(t_blur_input, s_blur_input, uv_b).b,
-            strength,
-        );
+        color.r = sample_blur_pyramid(uv_r, target_radius).r;
+        color.g = sample_blur_pyramid(refracted_uv, target_radius).g;
+        color.b = sample_blur_pyramid(uv_b, target_radius).b;
     } else {
-        let blurred = textureSample(t_blur_input, s_blur_input, refracted_uv);
-        let sharp = textureSample(t_unblurred_input, s_blur_input, refracted_uv);
-        color = mix(sharp, blurred, strength);
+        color = sample_blur_pyramid(refracted_uv, target_radius);
     }
     color.a = 1.0;
 
@@ -1731,17 +1724,14 @@ fn fs_mirror_rect(input: MirrorRectVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let strength = gradient_blur_strength(
+    let target_radius = gradient_target_radius(
         input.position.xy,
         rect.bounds,
         rect.blur_radius,
         rect.blur_radius_end,
         rect.gradient_direction,
-        scene_blur.max_blur_radius,
     );
-    let blurred = textureSample(t_blur_input, s_blur_input, src_uv);
-    let sharp = textureSample(t_unblurred_input, s_blur_input, src_uv);
-    var color = mix(sharp, blurred, strength);
+    var color = sample_blur_pyramid(src_uv, target_radius);
 
     let tint_rgba = hsla_to_rgba(rect.tint);
     color = vec4<f32>(mix(color.rgb, tint_rgba.rgb, tint_rgba.a), 1.0);

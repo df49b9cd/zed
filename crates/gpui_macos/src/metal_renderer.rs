@@ -147,13 +147,18 @@ pub(crate) struct MetalRenderer {
     /// Dual-Kawase scratch chain. `blur_chain_textures[0]` is surface-sized
     /// and receives the framebuffer snapshot; each subsequent level is
     /// half-sized. `BlurEffect::kernel_levels` selects the depth used per
-    /// frame (1..=5).
+    /// frame (1..=5). The upsample phase overwrites `chain[0..N-1]`, so
+    /// fragment shaders sample `blur_pyramid_texture` for intermediate
+    /// blur radii, not the chain.
     blur_chain_textures: [Option<metal::Texture>; BLUR_CHAIN_LEVELS],
-    /// Un-blurred copy of the framebuffer, preserved across the Kawase
-    /// chain so variable-radius blur / lens primitives can mix between
-    /// the blurred and un-blurred sources per pixel. Allocated alongside
-    /// `blur_chain_textures[0]`.
-    framebuffer_snapshot_texture: Option<metal::Texture>,
+    /// Preserved downsample pyramid: a single mipmapped texture where mip
+    /// 0 is the un-blurred framebuffer snapshot and each subsequent mip is
+    /// the Kawase-downsample result of the previous level. Written once
+    /// per frame after the Kawase downsample loop (before upsample would
+    /// overwrite the chain). Fragment shaders sample this with
+    /// `textureSampleLevel` at fractional LOD to produce a per-pixel
+    /// variable-radius blur.
+    blur_pyramid_texture: Option<metal::Texture>,
 }
 
 /// Maximum blur chain depth (`kernel_levels` is clamped to this).
@@ -424,6 +429,9 @@ impl MetalRenderer {
             let desc = metal::SamplerDescriptor::new();
             desc.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
             desc.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+            // Trilinear filtering between pyramid mip levels is what makes
+            // the per-pixel variable-radius blur smooth.
+            desc.set_mip_filter(metal::MTLSamplerMipFilter::Linear);
             desc.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
             desc.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
             device.new_sampler(&desc)
@@ -465,7 +473,7 @@ impl MetalRenderer {
             mirror_rect_pipeline_state,
             blur_sampler,
             blur_chain_textures: Default::default(),
-            framebuffer_snapshot_texture: None,
+            blur_pyramid_texture: None,
         }
     }
 
@@ -571,16 +579,15 @@ impl MetalRenderer {
             descriptor.set_width(width);
             descriptor.set_height(height);
             descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_mipmap_level_count(BLUR_CHAIN_LEVELS as u64);
             descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-            descriptor.set_usage(
-                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-            );
-            self.framebuffer_snapshot_texture = Some(self.device.new_texture(&descriptor));
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            self.blur_pyramid_texture = Some(self.device.new_texture(&descriptor));
         } else {
             for slot in &mut self.blur_chain_textures {
                 *slot = None;
             }
-            self.framebuffer_snapshot_texture = None;
+            self.blur_pyramid_texture = None;
         }
     }
 
@@ -915,7 +922,8 @@ impl MetalRenderer {
             (scene_max_blur_radius / BLUR_REFERENCE_RADIUS_PX).clamp(0.1, 4.0);
         let scene_blur_params = SceneBlurParams {
             max_blur_radius: scene_max_blur_radius,
-            _pad: [0.0; 3],
+            kernel_levels: blur_kernel_levels as f32,
+            _pad: [0.0; 2],
         };
         // Tracks whether the Kawase chain already reflects the drawable
         // contents since the last non-blur batch. Reset to `false` at
@@ -1513,7 +1521,7 @@ impl MetalRenderer {
         let snapshot = self.blur_chain_textures[0]
             .as_ref()
             .expect("chain level 0 checked above");
-        let Some(ref framebuffer_snapshot) = self.framebuffer_snapshot_texture else {
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
             return false;
         };
 
@@ -1523,13 +1531,15 @@ impl MetalRenderer {
             height: texture.height(),
             depth: 1,
         };
+        // Mip 0 of the pyramid is the un-blurred framebuffer; the Kawase
+        // chain runs in parallel on `blur_chain_textures`.
         blit.copy_from_texture(
             texture,
             0,
             0,
             metal::MTLOrigin { x: 0, y: 0, z: 0 },
             full_size,
-            framebuffer_snapshot,
+            pyramid,
             0,
             0,
             metal::MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1568,6 +1578,35 @@ impl MetalRenderer {
                 },
             );
         }
+
+        // Preserve the downsample chain into pyramid mip levels before the
+        // upsample loop overwrites `chain[0..N-1]`. Each `chain[i]` is the
+        // /2^i-sized result of `i` Kawase downsample passes, which maps to
+        // pyramid mip level `i`.
+        let preserve_blit = command_buffer.new_blit_command_encoder();
+        for i in 1..=kernel_levels {
+            let src = self.blur_chain_textures[i]
+                .as_ref()
+                .expect("chain level checked above");
+            let width = ((viewport_size.width.0 as u64) >> i).max(1);
+            let height = ((viewport_size.height.0 as u64) >> i).max(1);
+            preserve_blit.copy_from_texture(
+                src,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                metal::MTLSize {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                pyramid,
+                0,
+                i as u64,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }
+        preserve_blit.end_encoding();
 
         for step in 0..kernel_levels {
             let src_level = kernel_levels - step;
@@ -1637,10 +1676,7 @@ impl MetalRenderer {
         if rects.is_empty() {
             return true;
         }
-        let Some(ref snapshot) = self.blur_chain_textures[0] else {
-            return false;
-        };
-        let Some(ref unblurred) = self.framebuffer_snapshot_texture else {
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
             return false;
         };
         align_offset(instance_offset);
@@ -1677,9 +1713,7 @@ impl MetalRenderer {
             &scene_blur_params as *const SceneBlurParams as *const _,
         );
         command_encoder
-            .set_fragment_texture(BlurRectInputIndex::BlurTexture as u64, Some(snapshot));
-        command_encoder
-            .set_fragment_texture(BlurRectInputIndex::UnblurredTexture as u64, Some(unblurred));
+            .set_fragment_texture(BlurRectInputIndex::BlurPyramid as u64, Some(pyramid));
         command_encoder.set_fragment_sampler_state(
             BlurRectInputIndex::BlurSampler as u64,
             Some(&self.blur_sampler),
@@ -1724,10 +1758,7 @@ impl MetalRenderer {
         if shapes.is_empty() {
             return false;
         }
-        let Some(ref snapshot) = self.blur_chain_textures[0] else {
-            return false;
-        };
-        let Some(ref unblurred) = self.framebuffer_snapshot_texture else {
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
             return false;
         };
         align_offset(instance_offset);
@@ -1798,11 +1829,7 @@ impl MetalRenderer {
             &scene_blur_params as *const SceneBlurParams as *const _,
         );
         command_encoder
-            .set_fragment_texture(LensRectInputIndex::BlurTexture as u64, Some(snapshot));
-        command_encoder.set_fragment_texture(
-            LensRectInputIndex::UnblurredTexture as u64,
-            Some(unblurred),
-        );
+            .set_fragment_texture(LensRectInputIndex::BlurPyramid as u64, Some(pyramid));
         command_encoder.set_fragment_sampler_state(
             LensRectInputIndex::BlurSampler as u64,
             Some(&self.blur_sampler),
@@ -1830,10 +1857,7 @@ impl MetalRenderer {
         if rects.is_empty() {
             return true;
         }
-        let Some(ref snapshot) = self.blur_chain_textures[0] else {
-            return false;
-        };
-        let Some(ref unblurred) = self.framebuffer_snapshot_texture else {
+        let Some(ref pyramid) = self.blur_pyramid_texture else {
             return false;
         };
         align_offset(instance_offset);
@@ -1870,11 +1894,7 @@ impl MetalRenderer {
             &scene_blur_params as *const SceneBlurParams as *const _,
         );
         command_encoder
-            .set_fragment_texture(MirrorRectInputIndex::BlurTexture as u64, Some(snapshot));
-        command_encoder.set_fragment_texture(
-            MirrorRectInputIndex::UnblurredTexture as u64,
-            Some(unblurred),
-        );
+            .set_fragment_texture(MirrorRectInputIndex::BlurPyramid as u64, Some(pyramid));
         command_encoder.set_fragment_sampler_state(
             MirrorRectInputIndex::BlurSampler as u64,
             Some(&self.blur_sampler),
@@ -2436,10 +2456,12 @@ enum BlurRectInputIndex {
     Vertices = 0,
     Rects = 1,
     ViewportSize = 2,
-    BlurTexture = 3,
+    /// Mipmapped pyramid: mip 0 is un-blurred, each subsequent mip is a
+    /// Kawase downsample step. The fragment shader picks a fractional
+    /// LOD based on per-pixel target blur radius.
+    BlurPyramid = 3,
     BlurSampler = 4,
-    UnblurredTexture = 5,
-    SceneBlurParams = 6,
+    SceneBlurParams = 5,
 }
 
 #[repr(C)]
@@ -2447,11 +2469,10 @@ enum LensRectInputIndex {
     Vertices = 0,
     Rects = 1,
     ViewportSize = 2,
-    BlurTexture = 3,
+    BlurPyramid = 3,
     BlurSampler = 4,
     Shapes = 5,
-    UnblurredTexture = 6,
-    SceneBlurParams = 7,
+    SceneBlurParams = 6,
 }
 
 #[repr(C)]
@@ -2459,23 +2480,26 @@ enum MirrorRectInputIndex {
     Vertices = 0,
     Rects = 1,
     ViewportSize = 2,
-    BlurTexture = 3,
+    BlurPyramid = 3,
     BlurSampler = 4,
-    UnblurredTexture = 5,
-    SceneBlurParams = 6,
+    SceneBlurParams = 5,
 }
 
 /// Scene-wide blur parameters that the gradient-blur shaders use to
-/// normalize per-pixel strength. Written once per frame and bound to both
-/// `blur_rect` and `lens_rect` pipelines.
+/// compute a per-pixel mip level into the preserved downsample pyramid.
+/// Written once per frame and bound to every blur-consuming pipeline.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SceneBlurParams {
     /// Maximum `blur_radius` anywhere in the scene (see
-    /// `Scene::max_blur_radius`). Used by the shader to scale per-pixel
-    /// gradient strength into a [0, 1] mix factor.
+    /// `Scene::max_blur_radius`). The per-pixel `target_radius / max`
+    /// ratio becomes the `strength` input to the log2 mip-level formula.
     max_blur_radius: f32,
-    _pad: [f32; 3],
+    /// Number of Kawase downsample passes actually run this frame, as an
+    /// `f32` for the shader's `log2(strength)` clamping math. Matches
+    /// `Scene::max_blur_kernel_levels`.
+    kernel_levels: f32,
+    _pad: [f32; 2],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
