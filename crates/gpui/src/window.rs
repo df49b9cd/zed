@@ -53,7 +53,7 @@ use std::{
     ops::{DerefMut, Range},
     rc::Rc,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
@@ -3417,7 +3417,7 @@ impl Window {
             blur_radius_end: effect.radius_end.scale(scale_factor),
             gradient_direction: effect.gradient_direction,
             tint: effect.tint.opacity(opacity),
-            _pad_end: [0.0; 2],
+            pad_end: [0.0; 2],
         });
     }
 
@@ -3449,13 +3449,20 @@ impl Window {
     /// distance fields — the GPU-side equivalent of SwiftUI's
     /// `GlassEffectContainer(spacing:)`.
     ///
-    /// `edge_blend_distance` of 0 disables merging: each shape contributes
-    /// its own refraction but they remain visually distinct where they
-    /// overlap. Accepts 1..=`MAX_LENS_SHAPES_PER_GROUP` shapes; violations
-    /// trip a `debug_assert!`.
+    /// `edge_blend_distance` is in window pixels (pre-scale) and defines the
+    /// smooth-minimum radius used when merging shapes' SDFs. The union AABB
+    /// is padded by this distance on every side so the merge field has room
+    /// to settle. Negative values are clamped to zero; `0` disables merging
+    /// entirely.
+    ///
+    /// Accepts 1..=`MAX_LENS_SHAPES_PER_GROUP` shapes; violations trip a
+    /// `debug_assert!`.
     ///
     /// Same render-pass-break caveat as `paint_blur_rect` — keep the number
     /// of lens rects per frame small.
+    ///
+    /// This method should only be called as part of the paint phase of
+    /// element drawing.
     pub fn paint_lens_rect_union(
         &mut self,
         shapes: impl IntoIterator<Item = LensShapeSpec>,
@@ -3478,7 +3485,8 @@ impl Window {
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
 
-        let mut specs: Vec<LensShapeSpec> = shapes.into_iter().collect();
+        let mut specs: SmallVec<[LensShapeSpec; MAX_LENS_SHAPES_PER_GROUP]> =
+            shapes.into_iter().collect();
         debug_assert!(
             !specs.is_empty(),
             "paint_lens_rect_union requires at least one shape"
@@ -3489,6 +3497,14 @@ impl Window {
             specs.len()
         );
         if specs.is_empty() {
+            static EMPTY_WARNED: OnceLock<()> = OnceLock::new();
+            if EMPTY_WARNED.set(()).is_ok() {
+                log::warn!(
+                    "paint_lens_rect_union called with no shapes; the lens will \
+                     not render. Callers filtering dynamic inputs should early-out \
+                     before calling this."
+                );
+            }
             return;
         }
         specs.truncate(MAX_LENS_SHAPES_PER_GROUP);
@@ -3510,7 +3526,7 @@ impl Window {
         // masks are intersected with the element's mask so callers can't
         // bypass the element clip.
         let element_mask_bounds = content_mask.bounds;
-        let scaled_shapes: Vec<LensShape> = specs
+        let scaled_shapes: SmallVec<[LensShape; MAX_LENS_SHAPES_PER_GROUP]> = specs
             .into_iter()
             .map(|spec| {
                 let shape_mask = spec
@@ -3560,6 +3576,9 @@ impl Window {
     ///
     /// Like `paint_blur_rect` and `paint_lens_rect`, each mirror rect
     /// forces a render-pass break so the framebuffer can be sampled.
+    ///
+    /// This method should only be called as part of the paint phase of
+    /// element drawing.
     pub fn paint_mirror_rect(
         &mut self,
         source: Bounds<Pixels>,
@@ -6372,6 +6391,8 @@ impl MirrorAxis {
 }
 
 /// Configuration for [`Window::paint_mirror_rect`].
+///
+/// Defaults: horizontal flip, clip-to-destination enabled, no blur, no tint.
 #[derive(Clone, Copy, Debug)]
 pub struct MirrorEffect {
     /// How to flip the sampled source region.
@@ -6381,6 +6402,8 @@ pub struct MirrorEffect {
     pub clip_to_destination: bool,
     /// Optional backdrop blur applied to the mirrored source. When
     /// `None`, the un-blurred framebuffer snapshot is sampled directly.
+    /// See [`BlurEffect`] for uniform vs. linear-gradient semantics — the
+    /// gradient, if any, is evaluated in destination (not source) space.
     pub blur: Option<BlurEffect>,
     /// Color overlay applied after mirroring.
     pub tint: Hsla,
@@ -6411,5 +6434,50 @@ impl MirrorEffect {
     pub fn with_blur(mut self, blur: BlurEffect) -> Self {
         self.blur = Some(blur);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_axis_flags_map_to_expected_bits() {
+        assert_eq!(MirrorAxis::None.flags(), 0);
+        assert_eq!(MirrorAxis::Horizontal.flags(), MIRROR_AXIS_HORIZONTAL);
+        assert_eq!(MirrorAxis::Vertical.flags(), MIRROR_AXIS_VERTICAL);
+        assert_eq!(
+            MirrorAxis::Both.flags(),
+            MIRROR_AXIS_HORIZONTAL | MIRROR_AXIS_VERTICAL,
+        );
+    }
+
+    #[test]
+    fn blur_effect_linear_gradient_sets_axis() {
+        let horizontal = BlurEffect::linear_gradient(px(0.0), px(20.0), BlurAxis::Horizontal);
+        assert_eq!(horizontal.radius, px(0.0));
+        assert_eq!(horizontal.radius_end, px(20.0));
+        assert_eq!(horizontal.gradient_direction, [1.0, 0.0]);
+
+        let vertical = BlurEffect::linear_gradient(px(5.0), px(12.0), BlurAxis::Vertical);
+        assert_eq!(vertical.gradient_direction, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn lens_effect_linear_gradient_sets_axis() {
+        let horizontal = LensEffect::linear_gradient(px(0.0), px(20.0), BlurAxis::Horizontal);
+        assert_eq!(horizontal.radius, px(0.0));
+        assert_eq!(horizontal.radius_end, px(20.0));
+        assert_eq!(horizontal.gradient_direction, [1.0, 0.0]);
+
+        let vertical = LensEffect::linear_gradient(px(5.0), px(12.0), BlurAxis::Vertical);
+        assert_eq!(vertical.gradient_direction, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn with_gradient_direction_overrides_axis() {
+        let effect =
+            BlurEffect::default().with_gradient_direction([0.5f32.sqrt(), 0.5f32.sqrt()]);
+        assert_eq!(effect.gradient_direction, [0.5f32.sqrt(), 0.5f32.sqrt()]);
     }
 }

@@ -1,11 +1,11 @@
 // Dual-Kawase blur inner passes (Marius Bjorge, ARM, SIGGRAPH 2015).
 //
-// These fragment entry points run on fullscreen triangles against
-// progressively smaller scratch textures. The driving renderer is
-// responsible for allocating the ping-pong mip chain and orchestrating
-// the down → up sequence. The final upsampled texture is bound into the
-// main shader module's `t_blur_input` slot for `fs_blur_rect` /
-// `fs_lens_rect` to sample.
+// Only the downsample half of the original down→up sequence runs here:
+// the renderer preserves every chain[i] into pyramid mip `i` after the
+// downsample loop, and `fs_blur_rect` / `fs_lens_rect` sample the pyramid
+// at a fractional LOD to produce variable-radius blur. The upsample
+// passes that the original Kawase paper describes are therefore dead
+// code for this renderer and are intentionally omitted.
 
 struct BlurParams {
     viewport_size: vec2<f32>,
@@ -22,6 +22,12 @@ struct BlurFullscreenVarying {
     @location(0) uv: vec2<f32>,
 }
 
+// Gamma conversion uses the fast γ=2.2 power-curve approximation rather
+// than the full piecewise sRGB transfer. The toe (c < 0.04045) is slightly
+// darker than the exact transfer, but downsample runs N passes per frame
+// and the piecewise branch costs more than the perceptual error is worth
+// for a backdrop blur. Keep in sync with any new gamma-sensitive sample
+// sites added here.
 fn linearize(c: vec3<f32>) -> vec3<f32> {
     return pow(c, vec3<f32>(2.2));
 }
@@ -57,17 +63,3 @@ fn fs_blur_downsample(input: BlurFullscreenVarying) -> @location(0) vec4<f32> {
     return vec4<f32>(encode_srgb(averaged.rgb), averaged.a);
 }
 
-@fragment
-fn fs_blur_upsample(input: BlurFullscreenVarying) -> @location(0) vec4<f32> {
-    let o = 0.5 / blur_params.viewport_size * blur_params.offset_multiplier;
-    var color = sample_linear(input.uv + vec2<f32>(-o.x,  o.y)) * 2.0;
-    color += sample_linear(input.uv + vec2<f32>( o.x,  o.y)) * 2.0;
-    color += sample_linear(input.uv + vec2<f32>(-o.x, -o.y)) * 2.0;
-    color += sample_linear(input.uv + vec2<f32>( o.x, -o.y)) * 2.0;
-    color += sample_linear(input.uv + vec2<f32>(-o.x * 2.0, 0.0));
-    color += sample_linear(input.uv + vec2<f32>( o.x * 2.0, 0.0));
-    color += sample_linear(input.uv + vec2<f32>(0.0, -o.y * 2.0));
-    color += sample_linear(input.uv + vec2<f32>(0.0,  o.y * 2.0));
-    let averaged = color / 12.0;
-    return vec4<f32>(encode_srgb(averaged.rgb), averaged.a);
-}
