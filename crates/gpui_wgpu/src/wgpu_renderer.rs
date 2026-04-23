@@ -127,9 +127,10 @@ struct WgpuBindGroupLayouts {
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
     blur_io: wgpu::BindGroupLayout,
-    blur_rect: wgpu::BindGroupLayout,
-    lens_rect: wgpu::BindGroupLayout,
-    mirror_rect: wgpu::BindGroupLayout,
+    blur_scene: wgpu::BindGroupLayout,
+    blur_rect_instances: wgpu::BindGroupLayout,
+    lens_rect_instances: wgpu::BindGroupLayout,
+    mirror_rect_instances: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -170,6 +171,12 @@ struct WgpuResources {
     /// populated directly by the render passes, with no intermediate
     /// inter-texture copies.
     blur_down_bind_groups: [Option<wgpu::BindGroup>; BLUR_PYRAMID_LEVELS - 1],
+    /// Cached group(1) bind group shared by blur_rect, lens_rect, and
+    /// mirror_rect pipelines. Contains the pyramid view, sampler, and
+    /// scene_blur_params — all frame-stable resources that only change when
+    /// the pyramid is rebuilt. Created alongside the pyramid in
+    /// `ensure_intermediate_textures`, cleared on invalidation.
+    blur_scene_bind_group: Option<wgpu::BindGroup>,
     blur_sampler: wgpu::Sampler,
     /// Uniform buffer with per-pass `BlurParams` packed at
     /// `min_uniform_buffer_offset_alignment`-sized strides. Bound with
@@ -223,6 +230,7 @@ impl WgpuResources {
         for slot in &mut self.blur_down_bind_groups {
             *slot = None;
         }
+        self.blur_scene_bind_group = None;
     }
 }
 
@@ -619,6 +627,7 @@ impl WgpuRenderer {
             blur_pyramid_view: None,
             blur_pyramid_mip_views: Default::default(),
             blur_down_bind_groups: Default::default(),
+            blur_scene_bind_group: None,
             blur_sampler,
             blur_params_buffer,
             blur_params_slot_stride,
@@ -815,10 +824,10 @@ impl WgpuRenderer {
             },
             count: None,
         };
-        let blur_rect = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("blur_rect_layout"),
+
+        let blur_scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur_scene_layout"),
             entries: &[
-                storage_buffer_entry(0),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -839,53 +848,19 @@ impl WgpuRenderer {
             ],
         });
 
-        let lens_rect = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("lens_rect_layout"),
-            entries: &[
-                storage_buffer_entry(1),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                storage_buffer_entry(4),
-                scene_blur_params_entry,
-            ],
+        let blur_rect_instances = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur_rect_instances_layout"),
+            entries: &[storage_buffer_entry(0)],
         });
 
-        let mirror_rect = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mirror_rect_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                storage_buffer_entry(5),
-                scene_blur_params_entry,
-            ],
+        let lens_rect_instances = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lens_rect_instances_layout"),
+            entries: &[storage_buffer_entry(1), storage_buffer_entry(4)],
+        });
+
+        let mirror_rect_instances = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mirror_rect_instances_layout"),
+            entries: &[storage_buffer_entry(5)],
         });
 
         WgpuBindGroupLayouts {
@@ -894,9 +869,10 @@ impl WgpuRenderer {
             instances_with_texture,
             surfaces,
             blur_io,
-            blur_rect,
-            lens_rect,
-            mirror_rect,
+            blur_scene,
+            blur_rect_instances,
+            lens_rect_instances,
+            mirror_rect_instances,
         }
     }
 
@@ -1219,37 +1195,78 @@ impl WgpuRenderer {
 
         let blur_downsample = make_blur_io_pipeline("blur_downsample", "fs_blur_downsample");
 
-        let blur_rect = create_pipeline(
+        let create_blur_pipeline = |name: &str,
+                                    vs_entry: &str,
+                                    fs_entry: &str,
+                                    instances_layout: &wgpu::BindGroupLayout,
+                                    color_targets: &[Option<wgpu::ColorTargetState>],
+                                    module: &wgpu::ShaderModule| {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{name}_layout")),
+                bind_group_layouts: &[
+                    Some(&layouts.globals),
+                    Some(&layouts.blur_scene),
+                    Some(instances_layout),
+                ],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs_entry),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs_entry),
+                    targets: color_targets,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        let blur_rect = create_blur_pipeline(
             "blur_rect",
             "vs_blur_rect",
             "fs_blur_rect",
-            &layouts.globals,
-            &layouts.blur_rect,
-            wgpu::PrimitiveTopology::TriangleStrip,
+            &layouts.blur_rect_instances,
             &[Some(color_target.clone())],
-            1,
             &shader_module,
         );
-        let lens_rect = create_pipeline(
+        let lens_rect = create_blur_pipeline(
             "lens_rect",
             "vs_lens_rect",
             "fs_lens_rect",
-            &layouts.globals,
-            &layouts.lens_rect,
-            wgpu::PrimitiveTopology::TriangleStrip,
+            &layouts.lens_rect_instances,
             &[Some(color_target.clone())],
-            1,
             &shader_module,
         );
-        let mirror_rect = create_pipeline(
+        let mirror_rect = create_blur_pipeline(
             "mirror_rect",
             "vs_mirror_rect",
             "fs_mirror_rect",
-            &layouts.globals,
-            &layouts.mirror_rect,
-            wgpu::PrimitiveTopology::TriangleStrip,
+            &layouts.mirror_rect_instances,
             &[Some(color_target)],
-            1,
             &shader_module,
         );
 
@@ -1481,8 +1498,35 @@ impl WgpuRenderer {
         }
 
         resources.blur_pyramid_texture = Some(pyramid_texture);
-        resources.blur_pyramid_view = Some(pyramid_view);
+        resources.blur_pyramid_view = Some(pyramid_view.clone());
         resources.blur_pyramid_mip_views = mip_views;
+
+        // Cache the group(1) bind group shared by blur/lens/mirror pipelines.
+        // Contains only frame-stable resources (pyramid view, sampler,
+        // scene_blur_params), so it survives across frames until the pyramid
+        // is invalidated.
+        resources.blur_scene_bind_group = Some(
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("blur_scene_bind_group"),
+                    layout: &resources.bind_group_layouts.blur_scene,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&pyramid_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: resources.scene_blur_params_buffer.as_entire_binding(),
+                        },
+                    ],
+                }),
+        );
 
         // Pre-build one bind group per downsample pass. Pass `i` samples
         // `mip_views[i]` and writes `mip_views[i + 1]`. Only pairs up to
@@ -2357,36 +2401,23 @@ impl WgpuRenderer {
             return false;
         };
         let resources = self.resources();
-        let Some(pyramid_view) = resources.blur_pyramid_view.as_ref() else {
+        let Some(scene_bind_group) = resources.blur_scene_bind_group.as_ref() else {
             return true;
         };
-        let bind_group = resources
+        let instances_bind_group = resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blur_rect_bind_group"),
-                layout: &resources.bind_group_layouts.blur_rect,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.instance_binding(offset, size),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(pyramid_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
-                    },
-                ],
+                label: Some("blur_rect_instances_bind_group"),
+                layout: &resources.bind_group_layouts.blur_rect_instances,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.instance_binding(offset, size),
+                }],
             });
         pass.set_pipeline(&resources.pipelines.blur_rect);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-        pass.set_bind_group(1, &bind_group, &[]);
+        pass.set_bind_group(1, scene_bind_group, &[]);
+        pass.set_bind_group(2, &instances_bind_group, &[]);
         pass.draw(0..4, 0..rects.len() as u32);
         true
     }
@@ -2417,40 +2448,29 @@ impl WgpuRenderer {
             return false;
         };
         let resources = self.resources();
-        let Some(pyramid_view) = resources.blur_pyramid_view.as_ref() else {
+        let Some(scene_bind_group) = resources.blur_scene_bind_group.as_ref() else {
             return true;
         };
-        let bind_group = resources
+        let instances_bind_group = resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("lens_rect_bind_group"),
-                layout: &resources.bind_group_layouts.lens_rect,
+                label: Some("lens_rect_instances_bind_group"),
+                layout: &resources.bind_group_layouts.lens_rect_instances,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: self.instance_binding(rects_offset, rects_size),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(pyramid_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
-                    },
-                    wgpu::BindGroupEntry {
                         binding: 4,
                         resource: self.instance_binding(shapes_offset, shapes_size),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
                     },
                 ],
             });
         pass.set_pipeline(&resources.pipelines.lens_rect);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-        pass.set_bind_group(1, &bind_group, &[]);
+        pass.set_bind_group(1, scene_bind_group, &[]);
+        pass.set_bind_group(2, &instances_bind_group, &[]);
         pass.draw(0..4, 0..rects.len() as u32);
         true
     }
@@ -2469,36 +2489,23 @@ impl WgpuRenderer {
             return false;
         };
         let resources = self.resources();
-        let Some(pyramid_view) = resources.blur_pyramid_view.as_ref() else {
+        let Some(scene_bind_group) = resources.blur_scene_bind_group.as_ref() else {
             return true;
         };
-        let bind_group = resources
+        let instances_bind_group = resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("mirror_rect_bind_group"),
-                layout: &resources.bind_group_layouts.mirror_rect,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(pyramid_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&resources.blur_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: self.instance_binding(offset, size),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: resources.scene_blur_params_buffer.as_entire_binding(),
-                    },
-                ],
+                label: Some("mirror_rect_instances_bind_group"),
+                layout: &resources.bind_group_layouts.mirror_rect_instances,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.instance_binding(offset, size),
+                }],
             });
         pass.set_pipeline(&resources.pipelines.mirror_rect);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-        pass.set_bind_group(1, &bind_group, &[]);
+        pass.set_bind_group(1, scene_bind_group, &[]);
+        pass.set_bind_group(2, &instances_bind_group, &[]);
         pass.draw(0..4, 0..rects.len() as u32);
         true
     }

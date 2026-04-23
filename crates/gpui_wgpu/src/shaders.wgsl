@@ -1339,15 +1339,17 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 // framebuffer texture. The dual-Kawase blur that produces that input texture
 // runs through a separate, standalone shader module (`blur_io_shaders.wgsl`).
 //
-// These entry points fit the existing two-group pattern:
+// Bind group layout:
 //   @group(0) = globals (shared uniforms)
-//   @group(1) = instance storage buffer + blurred texture + sampler
+//   @group(1) = blurred texture + sampler + scene-blur params (frame-stable)
+//   @group(2) = instance storage buffers (per-batch)
 //
-// Each pipeline uses only a subset of group(1)'s bindings:
-//   blur_rect: binding 0 (b_blur_rects), binding 2 (t_blur_input), binding 3
-//   lens_rect: binding 1 (b_lens_rects), binding 2, binding 3
-// Declaring both storage buffers at distinct bindings lets a single shader
-// module host both pipelines without binding collisions.
+// Each pipeline uses only a subset of group(2)'s bindings:
+//   blur_rect:   binding 0 (b_blur_rects)
+//   lens_rect:   binding 1 (b_lens_rects), binding 4 (b_lens_shapes)
+//   mirror_rect: binding 5 (b_mirror_rects)
+// Declaring all storage buffers at distinct bindings lets a single shader
+// module host all pipelines without binding collisions.
 // ============================================================================
 
 struct BlurRect {
@@ -1418,15 +1420,15 @@ struct MirrorRect {
     tint: Hsla,
 }
 
-@group(1) @binding(0) var<storage, read> b_blur_rects: array<BlurRect>;
-@group(1) @binding(1) var<storage, read> b_lens_rects: array<LensRect>;
+@group(2) @binding(0) var<storage, read> b_blur_rects: array<BlurRect>;
+@group(2) @binding(1) var<storage, read> b_lens_rects: array<LensRect>;
 // Mipmapped pyramid: mip 0 = un-blurred framebuffer snapshot, each
 // subsequent mip = Kawase downsample result of the previous level.
 // Fragment shaders pick fractional LOD via `textureSampleLevel`.
 @group(1) @binding(2) var t_blur_pyramid: texture_2d<f32>;
 @group(1) @binding(3) var s_blur_input: sampler;
-@group(1) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
-@group(1) @binding(5) var<storage, read> b_mirror_rects: array<MirrorRect>;
+@group(2) @binding(4) var<storage, read> b_lens_shapes: array<LensShape>;
+@group(2) @binding(5) var<storage, read> b_mirror_rects: array<MirrorRect>;
 @group(1) @binding(6) var<uniform> scene_blur: SceneBlurParams;
 
 // --- BlurRect: rounded rect that samples the blurred framebuffer ---
